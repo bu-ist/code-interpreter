@@ -67,7 +67,11 @@ RUN bun install --frozen-lockfile
 COPY api/src ./src
 COPY shared /shared
 COPY api/tsconfig.json ./
-RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*'
+# Build sandbox API for Bun and tool-call socket proxy for Node (CJS).
+# The proxy must run under Node, not Bun: Bun's node:http compat layer never
+# fires 'connection' events which silently disables DoS protections.
+RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*' && \
+    bun build ./src/tool-call-socket-proxy.ts --target=node --format=cjs --outfile=.build/tool-call-socket-proxy.cjs
 
 # ============================================================================
 # Stage 4: Build sandbox rootfs (full OS layer for the microVM guest)
@@ -199,6 +203,95 @@ COPY --from=worker-builder /app/src/matplotlib.py /app/src/matplotlib-async.py .
 # --- Supervisor ---
 COPY docker/supervisor.sh /supervisor.sh
 RUN chmod +x /supervisor.sh
+
+WORKDIR /
+EXPOSE 2000 3113
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:3113/health || exit 1
+
+CMD ["/supervisor.sh"]
+
+# ============================================================================
+# Stage 7: Final combined image for no-KVM/aarch64 environments (Debian-based)
+#
+# The Fedora-based Stage 6 uses bind mounts to overlay a Debian rootfs over
+# the Fedora base for the no-KVM path. This works on x86_64 because Fedora
+# keeps 64-bit libraries in /usr/lib64 (separate from /usr/lib), so binding
+# Debian's /usr/lib leaves the Fedora runtime intact. On aarch64 (AWS
+# Graviton / EKS), Fedora and Debian BOTH use /usr/lib as the primary library
+# directory — binding it replaces the Fedora dynamic linker and all runtime
+# libraries, crashing every subsequent Fedora binary.
+#
+# This stage is a pure Debian image where NsJail, the sandbox API, and the
+# worker all live at their native Debian paths. No bind mounts or
+# architecture-specific compatibility shims are required.
+#
+# Build with: docker build --target worker-sandbox-nokvm ...
+# ============================================================================
+FROM oven/bun:1.3.14-debian AS worker-sandbox-nokvm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
+    util-linux \
+    procps \
+    coreutils \
+    curl \
+    nodejs \
+    ca-certificates \
+    libnl-route-3-200 \
+    libprotobuf32 \
+    libffi8 \
+    iptables \
+    jq \
+    bsdextrautils \
+    locales
+
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+
+# NsJail binary and spec-guard from builder
+COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
+COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
+
+# Node binary for tool-call-socket-proxy.cjs (must run under Node, not Bun)
+COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+
+# libffi.so.6 -> libffi.so.8 compat symlink (NsJail protobuf dep expects .so.6)
+RUN libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
+    && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
+    && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+# Restore awk -> mawk symlink (slim image skips postinst update-alternatives)
+RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk || true
+
+# Sandbox API
+WORKDIR /sandbox_api
+COPY api/package.json ./
+RUN bun install --frozen-lockfile --production
+COPY --from=sandbox-builder /app/.build ./.build
+COPY api/config ./config
+COPY api/src/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
+RUN mkdir -p /pkgs /host-packages /tmp/sandbox
+
+# Worker
+WORKDIR /worker
+COPY service/package.json service/bun.lock ./
+RUN bun install --frozen-lockfile --production
+COPY --from=worker-builder /app/.build ./.build
+COPY --from=worker-builder /app/src ./src
+COPY --from=worker-builder /app/src/matplotlib.py /app/src/matplotlib-async.py ./
+
+# Startup scripts
+COPY docker/supervisor.sh /supervisor.sh
+COPY docker/start-direct-sandbox-nokvm.sh /usr/local/bin/start-direct-sandbox.sh
+RUN chmod +x /supervisor.sh /usr/local/bin/start-direct-sandbox.sh
 
 WORKDIR /
 EXPOSE 2000 3113
