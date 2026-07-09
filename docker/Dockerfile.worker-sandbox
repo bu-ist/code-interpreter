@@ -159,7 +159,7 @@ RUN cargo build --release
 # ============================================================================
 # Stage 6: Final combined image (Fedora for libkrun runtime)
 # ============================================================================
-FROM fedora:43
+FROM fedora:43 AS worker-sandbox-kvm
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
