@@ -1,0 +1,205 @@
+name: Build & push code-interpreter images
+
+# Triggered only from BU integration branches and version tags.
+# Pushes to `main` (upstream sync) do NOT trigger image builds — main is kept
+# clean of BU-specific CI so PRs back to LibreChat-AI/code-interpreter never
+# include this file.
+#
+# Branch → ECR tag mapping:
+#   bu/main  → latest  +  YYYYMMDD-sha8  (prod ECR on main; nonprod on bu/*)
+#   bu/test  → test
+#   bu/dev   → dev
+#   v*       → the semver tag  +  latest
+#
+# ECR accounts:
+#   nonprod (bu/* branches): 023495890451.dkr.ecr.us-east-1.amazonaws.com
+#   prod    (main branch):   651414516725.dkr.ecr.us-east-1.amazonaws.com
+#
+# OIDC: arn:aws:iam::<account>:role/github-actions-ecr-role
+# Trust policy covers repo:bu-ist/*:* — no IAM changes required.
+#
+# Platform split:
+#   linux/amd64  sandbox, package-init  — Intel KVM nodes (m7i.xlarge)
+#   linux/arm64  api, worker, egress, files, tcs  — Graviton nexus nodes
+#
+# Each image is single-platform; no multi-arch manifest merge needed.
+
+on:
+  push:
+    branches:
+      - bu/main
+      - bu/test
+      - bu/dev
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  contents: read
+  id-token: write  # OIDC for ECR
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      # Keep all 7 jobs running if one fails — a sandbox build failure must
+      # not block the arm64 service images, which are independent.
+      fail-fast: false
+      matrix:
+        include:
+          # ── amd64-only: Intel KVM sandbox nodes ───────────────────────────
+          - name: sandbox
+            runner: ubuntu-latest
+            platform: linux/amd64
+            dockerfile: docker/Dockerfile.worker-sandbox
+            target: worker-sandbox-kvm
+            ecr-repo: code-interpreter/sandbox
+            cache-slug: amd64
+
+          - name: package-init
+            runner: ubuntu-latest
+            platform: linux/amd64
+            dockerfile: docker/Dockerfile.package-init
+            target: ''
+            ecr-repo: code-interpreter/package-init
+            cache-slug: amd64
+
+          # ── arm64-only: Graviton nexus nodes ──────────────────────────────
+          - name: api
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            dockerfile: service/Dockerfile.api
+            target: ''
+            ecr-repo: code-interpreter/api
+            cache-slug: arm64
+
+          - name: worker
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            dockerfile: service/Dockerfile.worker
+            target: ''
+            ecr-repo: code-interpreter/worker
+            cache-slug: arm64
+
+          - name: egress
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            dockerfile: service/Dockerfile.egress-gateway
+            target: ''
+            ecr-repo: code-interpreter/egress
+            cache-slug: arm64
+
+          - name: files
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            dockerfile: service/Dockerfile.service
+            target: ''
+            ecr-repo: code-interpreter/files
+            cache-slug: arm64
+
+          - name: tcs
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            dockerfile: service/Dockerfile.tool-call-server
+            target: ''
+            ecr-repo: code-interpreter/tcs
+            cache-slug: arm64
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232b2  # v3.10.0
+        with:
+          driver-opts: image=moby/buildkit:latest
+
+      # ── ECR registry + OIDC role ─────────────────────────────────────────────
+      # bu/main → nonprod ECR (image built and tested on nonprod before promotion)
+      # main    → prod ECR (not triggered by this workflow; shown for completeness)
+      - name: Resolve ECR target
+        id: ecr
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "registry=651414516725.dkr.ecr.us-east-1.amazonaws.com" >> "$GITHUB_OUTPUT"
+            echo "role=arn:aws:iam::651414516725:role/github-actions-ecr-role"  >> "$GITHUB_OUTPUT"
+          else
+            echo "registry=023495890451.dkr.ecr.us-east-1.amazonaws.com" >> "$GITHUB_OUTPUT"
+            echo "role=arn:aws:iam::023495890451:role/github-actions-ecr-role"  >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Image tags ───────────────────────────────────────────────────────────
+      - name: Compute image tags
+        id: tags
+        run: |
+          REGISTRY="${{ steps.ecr.outputs.registry }}"
+          REPO="${{ matrix.ecr-repo }}"
+          case "${{ github.ref }}" in
+            refs/heads/bu/main)
+              DATE=$(date -u +%Y%m%d)
+              SHA="${GITHUB_SHA:0:8}"
+              echo "value=${REGISTRY}/${REPO}:latest,${REGISTRY}/${REPO}:${DATE}-${SHA}" >> "$GITHUB_OUTPUT"
+              ;;
+            refs/heads/bu/test)
+              echo "value=${REGISTRY}/${REPO}:test" >> "$GITHUB_OUTPUT"
+              ;;
+            refs/heads/bu/dev)
+              echo "value=${REGISTRY}/${REPO}:dev" >> "$GITHUB_OUTPUT"
+              ;;
+            refs/tags/*)
+              TAG="${GITHUB_REF#refs/tags/}"
+              echo "value=${REGISTRY}/${REPO}:${TAG},${REGISTRY}/${REPO}:latest" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "value=${REGISTRY}/${REPO}:${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6222  # v4.1.0
+        with:
+          role-to-assume: ${{ steps.ecr.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      - name: Build and push
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4  # v6.15.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.tags.outputs.value }}
+          labels: |
+            org.opencontainers.image.title=code-interpreter-${{ matrix.name }}
+            org.opencontainers.image.description=Boston University code interpreter — ${{ matrix.name }}
+            org.opencontainers.image.source=https://github.com/bu-ist/code-interpreter
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=Boston University — Data Engineering & AI
+            org.opencontainers.image.licenses=Proprietary
+          cache-from: type=gha,scope=${{ matrix.ecr-repo }}-${{ matrix.cache-slug }}
+          cache-to: type=gha,scope=${{ matrix.ecr-repo }}-${{ matrix.cache-slug }},mode=max
+          provenance: true
+          sbom: true
+
+      - name: Image summary
+        run: |
+          {
+            echo "### Built — ${{ matrix.ecr-repo }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Platform | \`${{ matrix.platform }}\` |"
+            echo "| Commit   | \`${GITHUB_SHA:0:8}\` |"
+            echo ""
+            echo "**Tags**"
+            echo '```'
+            echo "${{ steps.tags.outputs.value }}" | tr ',' '\n'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
