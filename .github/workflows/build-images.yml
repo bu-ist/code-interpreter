@@ -5,11 +5,11 @@ name: Build & push code-interpreter images
 # clean of BU-specific CI so PRs back to LibreChat-AI/code-interpreter never
 # include this file.
 #
-# Branch → ECR tag mapping:
-#   bu/main  → latest  +  YYYYMMDD-sha8  (prod ECR on main; nonprod on bu/*)
-#   bu/test  → test
-#   bu/dev   → dev
-#   v*       → the semver tag  +  latest
+# Branch → ECR tag mapping (ECR repos are IMMUTABLE):
+#   bu/main  → YYYYMMDD-sha8   (unique per commit; safe to re-push)
+#   bu/test  → test             (first push only; delete the old tag before re-pushing)
+#   bu/dev   → dev              (first push only; delete the old tag before re-pushing)
+#   v*       → the semver tag   (unique; safe to re-push)
 #
 # ECR accounts:
 #   nonprod (bu/* branches): 023495890451.dkr.ecr.us-east-1.amazonaws.com
@@ -97,8 +97,8 @@ jobs:
           - name: files
             runner: ubuntu-24.04-arm
             platform: linux/arm64
-            dockerfile: service/Dockerfile.service
-            target: ''
+            dockerfile: service/Dockerfile
+            target: production
             ecr-repo: code-interpreter/files
             cache-slug: arm64
 
@@ -141,7 +141,7 @@ jobs:
             refs/heads/bu/main)
               DATE=$(date -u +%Y%m%d)
               SHA="${GITHUB_SHA:0:8}"
-              echo "value=${REGISTRY}/${REPO}:latest,${REGISTRY}/${REPO}:${DATE}-${SHA}" >> "$GITHUB_OUTPUT"
+              echo "value=${REGISTRY}/${REPO}:${DATE}-${SHA}" >> "$GITHUB_OUTPUT"
               ;;
             refs/heads/bu/test)
               echo "value=${REGISTRY}/${REPO}:test" >> "$GITHUB_OUTPUT"
@@ -151,7 +151,7 @@ jobs:
               ;;
             refs/tags/*)
               TAG="${GITHUB_REF#refs/tags/}"
-              echo "value=${REGISTRY}/${REPO}:${TAG},${REGISTRY}/${REPO}:latest" >> "$GITHUB_OUTPUT"
+              echo "value=${REGISTRY}/${REPO}:${TAG}" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "value=${REGISTRY}/${REPO}:${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
