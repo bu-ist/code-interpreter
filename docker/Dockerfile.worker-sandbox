@@ -5,7 +5,7 @@
 #
 # Architecture within this container:
 # ┌──────────────────────────────────────────────────────────────────────────┐
-# │  Worker-Sandbox Container (Fedora 41, libkrun)                          │
+# │  Worker-Sandbox Container (Fedora 43, libkrun)                          │
 # │                                                                         │
 # │  ┌─────────────────┐        ┌──────────────────────────────────────────┐│
 # │  │  Worker Process │ ──────▶│  libkrun MicroVM (own kernel)            ││
@@ -42,8 +42,40 @@ RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
 RUN make -j$(nproc)
 
 COPY api/src/spec-guard.c /tmp/spec-guard.c
+COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
 RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
-    && chmod 0111 /usr/local/bin/spec-guard
+    && gcc -O2 -static -o /usr/local/bin/sandbox-rootfs-setup /tmp/rootfs-setup.c \
+    && chmod 0111 /usr/local/bin/spec-guard /usr/local/bin/sandbox-rootfs-setup
+
+# ============================================================================
+# Stage 1b: Build language runtime packages for the baked KVM root disk
+#
+# Mirrors docker/Dockerfile.package-init, but populates /pkgs at image-build
+# time so the combined worker can boot without a long-lived /host-packages
+# virtio-fs mount.
+# ============================================================================
+FROM buildpack-deps:bookworm AS package-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_VERSION=3.14.4
+ENV BUN_VERSION=1.3.14
+
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
+    curl unzip wget ca-certificates \
+    build-essential libssl-dev libffi-dev libsqlite3-dev \
+    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+    tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
+    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+    libfreetype6-dev
+
+RUN mkdir -p /pkgs
+
+COPY docker/package-init.sh /package-init.sh
+COPY javascript-packages.txt /javascript-packages.txt
+RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
 
 # ============================================================================
 # Stage 2: Build worker
@@ -53,6 +85,7 @@ WORKDIR /app
 COPY service/package.json service/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY service/src ./src
+COPY packages/code/src /packages/code/src
 COPY shared /shared
 COPY service/tsconfig.json ./
 RUN bun build ./src/worker-server.ts --minify --outdir .build --target bun --external '@opentelemetry/*'
@@ -67,11 +100,7 @@ RUN bun install --frozen-lockfile
 COPY api/src ./src
 COPY shared /shared
 COPY api/tsconfig.json ./
-# Build sandbox API for Bun and tool-call socket proxy for Node (CJS).
-# The proxy must run under Node, not Bun: Bun's node:http compat layer never
-# fires 'connection' events which silently disables DoS protections.
-RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*' && \
-    bun build ./src/tool-call-socket-proxy.ts --target=node --format=cjs --outfile=.build/tool-call-socket-proxy.cjs
+RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*'
 
 # ============================================================================
 # Stage 4: Build sandbox rootfs (full OS layer for the microVM guest)
@@ -123,6 +152,7 @@ RUN bun install --frozen-lockfile --production
 COPY --from=sandbox-builder /app/.build ./.build
 COPY api/config ./config
 COPY api/src/entrypoint.sh ./entrypoint.sh
+COPY api/src/guest-dns.sh ./guest-dns.sh
 RUN chmod +x ./entrypoint.sh
 
 RUN mkdir -p /pkgs /tmp/sandbox
@@ -157,9 +187,36 @@ COPY launcher/src/ ./src/
 RUN cargo build --release
 
 # ============================================================================
-# Stage 6: Final combined image (Fedora for libkrun runtime)
+# Stage 5b: Build the read-only ext4 guest root disk
 # ============================================================================
-FROM fedora:43 AS worker-sandbox-kvm
+FROM debian:bookworm AS worker-sandbox-rootfs-image
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    e2fsprogs \
+    coreutils \
+    gawk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sandbox-rootfs / /sandbox-rootfs/
+COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
+COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && bash /sandbox-rootfs/sandbox_api/guest-dns.sh --prepare-rootfs /sandbox-rootfs
+RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
+    && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
+
+# ============================================================================
+# Stage 6: Shared combined worker host (Fedora for libkrun runtime)
+#
+# Final targets:
+#   - worker-sandbox-baked: KVM default; packages live in a read-only ext4
+#                           block root, so no package virtio-fs mount is needed
+#   - worker-sandbox-legacy: directory root plus /host-packages for legacy KVM
+#                            deployments and KVM_ENABLED=false direct mode
+#   - worker-sandbox-{true,false}: Compose aliases selected by KVM_ENABLED
+# ============================================================================
+FROM fedora:43 AS worker-sandbox-base
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
@@ -179,15 +236,9 @@ ENV PATH="/root/.bun/bin:${PATH}"
 
 # --- Launcher (runs on host, boots microVM) ---
 COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
+COPY --from=nsjail-builder /usr/local/bin/sandbox-rootfs-setup /sandbox-rootfs-setup
 
-# --- Sandbox rootfs (becomes the microVM guest filesystem) ---
-COPY --from=sandbox-rootfs / /sandbox-rootfs/
-
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
-
-RUN mkdir -p /host-packages
-
-# --- Launcher entrypoint (DNS resolution + socat relay before VM boot) ---
+# --- Launcher entrypoint (resolver configuration before VM boot) ---
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
 RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh
@@ -212,223 +263,31 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 CMD ["/supervisor.sh"]
 
-# ============================================================================
-# Stage 7: Final combined image for no-KVM/aarch64 environments (Debian-based)
-#
-# The Fedora-based Stage 6 uses bind mounts to overlay a Debian rootfs over
-# the Fedora base for the no-KVM path. This works on x86_64 because Fedora
-# keeps 64-bit libraries in /usr/lib64 (separate from /usr/lib), so binding
-# Debian's /usr/lib leaves the Fedora runtime intact. On aarch64 (AWS
-# Graviton / EKS), Fedora and Debian BOTH use /usr/lib as the primary library
-# directory — binding it replaces the Fedora dynamic linker and all runtime
-# libraries, crashing every subsequent Fedora binary.
-#
-# This stage is a pure Debian image where NsJail, the sandbox API, and the
-# worker all live at their native Debian paths. No bind mounts or
-# architecture-specific compatibility shims are required.
-#
-# Build with: docker build --target worker-sandbox-nokvm ...
-# ============================================================================
-FROM oven/bun:1.3.14-debian AS worker-sandbox-nokvm
+# Legacy directory-root target. Keep this for deployments that intentionally
+# mount packages at /host-packages, and for the KVM_ENABLED=false direct path.
+FROM worker-sandbox-base AS worker-sandbox-legacy
 
-ENV DEBIAN_FRONTEND=noninteractive
+COPY --from=sandbox-rootfs / /sandbox-rootfs/
 
-COPY docker/apt-install.sh /usr/local/bin/apt-install
-RUN chmod +x /usr/local/bin/apt-install
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && bash /sandbox-rootfs/sandbox_api/guest-dns.sh --prepare-rootfs /sandbox-rootfs \
+    && mkdir -p /host-packages
 
-RUN apt-install \
-    util-linux \
-    procps \
-    coreutils \
-    curl \
-    nodejs \
-    ca-certificates \
-    libnl-route-3-200 \
-    libprotobuf32 \
-    libffi8 \
-    iptables \
-    jq \
-    bsdextrautils \
-    locales
+# KVM production default. The package tree is part of the read-only block root,
+# avoiding host file-descriptor retention from package lookups over virtio-fs.
+FROM worker-sandbox-base AS worker-sandbox-baked
 
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+COPY --from=worker-sandbox-rootfs-image /sandbox-rootfs.img /sandbox-rootfs.img
 
-# NsJail binary and spec-guard from builder
-COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
-COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
-RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
+ENV LAUNCHER_ROOT_DISK=/sandbox-rootfs.img \
+    LAUNCHER_ROOT_DISK_READ_ONLY=true \
+    LAUNCHER_ROOT_DEVICE=/dev/vda \
+    LAUNCHER_ROOT_FSTYPE=ext4 \
+    LAUNCHER_ROOT_OPTIONS=ro
 
-# Node binary for tool-call-socket-proxy.cjs (must run under Node, not Bun)
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+# Compose derives these aliases from KVM_ENABLED so the direct path keeps
+# selecting the directory-root image without duplicating the baked rootfs.
+FROM worker-sandbox-baked AS worker-sandbox-true
+FROM worker-sandbox-legacy AS worker-sandbox-false
 
-# libffi.so.6 -> libffi.so.8 compat symlink (NsJail protobuf dep expects .so.6)
-RUN libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
-    && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
-    && ln -sf "$libffi" "${libffi%.so.8}.so.6"
-
-# Restore awk -> mawk symlink (slim image skips postinst update-alternatives)
-RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk || true
-
-# Sandbox API
-WORKDIR /sandbox_api
-COPY api/package.json ./
-RUN bun install --frozen-lockfile --production
-COPY --from=sandbox-builder /app/.build ./.build
-COPY api/config ./config
-COPY api/src/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
-
-RUN mkdir -p /pkgs /host-packages /tmp/sandbox
-
-# Worker
-WORKDIR /worker
-COPY service/package.json service/bun.lock ./
-RUN bun install --frozen-lockfile --production
-COPY --from=worker-builder /app/.build ./.build
-COPY --from=worker-builder /app/src ./src
-COPY --from=worker-builder /app/src/matplotlib.py /app/src/matplotlib-async.py ./
-
-# Startup scripts
-COPY docker/supervisor.sh /supervisor.sh
-COPY docker/start-direct-sandbox-nokvm.sh /usr/local/bin/start-direct-sandbox.sh
-RUN chmod +x /supervisor.sh /usr/local/bin/start-direct-sandbox.sh
-
-WORKDIR /
-EXPOSE 2000 3113
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:3113/health || exit 1
-
-CMD ["/supervisor.sh"]
-
-# ============================================================================
-# Stage 8: Sandbox only, for AWS Lambda MicroVMs (arm64)
-#
-# Build with: docker build --platform linux/arm64 \
-#               --target sandbox-lambda-microvm ...
-#
-# Three things make this different from Stage 7, and each one is forced by the
-# Lambda MicroVM environment rather than chosen:
-#
-#   1. No worker. The worker keeps running in EKS and reaches this over the
-#      Lambda endpoint, so bundling it here would just be a second copy.
-#
-#   2. No libkrun, and none is needed. Lambda MicroVMs are Firecracker guests
-#      and do not expose nested virtualization, so KVM_ENABLED must be false.
-#      This is not the weaker "NsJail-only" posture that is unacceptable for
-#      untrusted code: the hardware VM boundary libkrun was providing is still
-#      there, it is just the Firecracker MicroVM itself, operated by AWS. NsJail
-#      still runs inside the guest. The layering is the same; the hypervisor
-#      changed hands.
-#
-#   3. Packages are baked in. A MicroVM has no PVC to mount, so the ~3 GB
-#      runtime tree that package-init writes to the PVC in cluster is built at
-#      image build time instead. Same script, same versions, same /pkgs path,
-#      so nothing in the sandbox API changes.
-#
-# arm64 is not a preference — ARM_64 is the only CpuConfigurations value
-# AWS::Lambda::MicrovmImage accepts.
-# ============================================================================
-FROM oven/bun:1.3.14-debian AS sandbox-lambda-microvm
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-COPY docker/apt-install.sh /usr/local/bin/apt-install
-RUN chmod +x /usr/local/bin/apt-install
-
-# Same runtime set as Stage 7, plus the build toolchain package-init needs to
-# compile CPython. The toolchain is removed again at the end of this stage.
-RUN apt-install \
-    util-linux \
-    procps \
-    coreutils \
-    curl \
-    wget \
-    unzip \
-    nodejs \
-    ca-certificates \
-    libnl-route-3-200 \
-    libprotobuf32 \
-    libffi8 \
-    iptables \
-    jq \
-    bc \
-    poppler-utils \
-    fonts-dejavu \
-    fonts-liberation \
-    bsdextrautils \
-    locales
-
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
-
-COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
-COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
-RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
-
-# tool-call-socket-proxy.cjs must run under Node, not Bun: Bun's node:http
-# compat layer never fires 'connection', which silently disables the proxy's
-# DoS protections.
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
-
-RUN libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
-    && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
-    && ln -sf "$libffi" "${libffi%.so.8}.so.6"
-
-RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk || true
-
-# --- Sandbox API ---
-WORKDIR /sandbox_api
-COPY api/package.json ./
-RUN bun install --frozen-lockfile --production
-COPY --from=sandbox-builder /app/.build ./.build
-COPY api/config ./config
-COPY api/src/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
-
-# --- Runtime packages, baked in ---
-# The build toolchain is installed, used, and purged in one layer so the
-# compilers never ship inside an image that runs untrusted code.
-COPY docker/package-init.sh /package-init.sh
-COPY javascript-packages.txt /javascript-packages.txt
-RUN chmod +x /package-init.sh \
-    && mkdir -p /pkgs \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-         build-essential libssl-dev libffi-dev libsqlite3-dev \
-         zlib1g-dev libbz2-dev libreadline-dev libncurses-dev \
-         tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
-         libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-         libfreetype6-dev \
-    && JS_PACKAGE_MANIFEST=/javascript-packages.txt /package-init.sh \
-    && test -s /pkgs/.initialized \
-    && apt-get purge -y --auto-remove \
-         build-essential libssl-dev libffi-dev libsqlite3-dev \
-         zlib1g-dev libbz2-dev libreadline-dev libncurses-dev \
-         tk-dev libcurl4-openssl-dev libfontconfig1-dev \
-         libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-         libfreetype6-dev \
-    && rm -rf /var/lib/apt/lists/* /package-init.sh /javascript-packages.txt
-
-RUN mkdir -p /tmp/sandbox
-
-# Same hardening Stage 4 applies to the microVM guest rootfs. The guest here
-# is the whole image, so it applies to the whole image.
-RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
-RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
-         /usr/bin/perl* /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
-         /usr/local/bin/apt-install \
-         /usr/sbin/adduser /usr/sbin/useradd /usr/sbin/usermod \
-         /usr/sbin/groupadd /usr/sbin/groupmod \
-         /usr/bin/su \
-         /usr/bin/chfn /usr/bin/chsh /usr/bin/gpasswd /usr/bin/newgrp \
-         /usr/bin/passwd /usr/bin/sg \
-         /usr/bin/chage /usr/bin/expiry /usr/sbin/unix_chkpwd \
-    2>/dev/null || true
-
-COPY docker/start-sandbox-lambda-microvm.sh /usr/local/bin/start-sandbox.sh
-RUN chmod +x /usr/local/bin/start-sandbox.sh
-
-WORKDIR /
-EXPOSE 2000
-
-CMD ["/usr/local/bin/start-sandbox.sh"]
+FROM worker-sandbox-true AS worker-sandbox-default
