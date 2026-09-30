@@ -300,3 +300,135 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -f http://localhost:3113/health || exit 1
 
 CMD ["/supervisor.sh"]
+
+# ============================================================================
+# Stage 8: Sandbox only, for AWS Lambda MicroVMs (arm64)
+#
+# Build with: docker build --platform linux/arm64 \
+#               --target sandbox-lambda-microvm ...
+#
+# Three things make this different from Stage 7, and each one is forced by the
+# Lambda MicroVM environment rather than chosen:
+#
+#   1. No worker. The worker keeps running in EKS and reaches this over the
+#      Lambda endpoint, so bundling it here would just be a second copy.
+#
+#   2. No libkrun, and none is needed. Lambda MicroVMs are Firecracker guests
+#      and do not expose nested virtualization, so KVM_ENABLED must be false.
+#      This is not the weaker "NsJail-only" posture that is unacceptable for
+#      untrusted code: the hardware VM boundary libkrun was providing is still
+#      there, it is just the Firecracker MicroVM itself, operated by AWS. NsJail
+#      still runs inside the guest. The layering is the same; the hypervisor
+#      changed hands.
+#
+#   3. Packages are baked in. A MicroVM has no PVC to mount, so the ~3 GB
+#      runtime tree that package-init writes to the PVC in cluster is built at
+#      image build time instead. Same script, same versions, same /pkgs path,
+#      so nothing in the sandbox API changes.
+#
+# arm64 is not a preference — ARM_64 is the only CpuConfigurations value
+# AWS::Lambda::MicrovmImage accepts.
+# ============================================================================
+FROM oven/bun:1.3.14-debian AS sandbox-lambda-microvm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+# Same runtime set as Stage 7, plus the build toolchain package-init needs to
+# compile CPython. The toolchain is removed again at the end of this stage.
+RUN apt-install \
+    util-linux \
+    procps \
+    coreutils \
+    curl \
+    wget \
+    unzip \
+    nodejs \
+    ca-certificates \
+    libnl-route-3-200 \
+    libprotobuf32 \
+    libffi8 \
+    iptables \
+    jq \
+    bc \
+    poppler-utils \
+    fonts-dejavu \
+    fonts-liberation \
+    bsdextrautils \
+    locales
+
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+
+COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
+COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
+
+# tool-call-socket-proxy.cjs must run under Node, not Bun: Bun's node:http
+# compat layer never fires 'connection', which silently disables the proxy's
+# DoS protections.
+COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+
+RUN libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
+    && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
+    && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk || true
+
+# --- Sandbox API ---
+WORKDIR /sandbox_api
+COPY api/package.json ./
+RUN bun install --frozen-lockfile --production
+COPY --from=sandbox-builder /app/.build ./.build
+COPY api/config ./config
+COPY api/src/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
+# --- Runtime packages, baked in ---
+# The build toolchain is installed, used, and purged in one layer so the
+# compilers never ship inside an image that runs untrusted code.
+COPY docker/package-init.sh /package-init.sh
+COPY javascript-packages.txt /javascript-packages.txt
+RUN chmod +x /package-init.sh \
+    && mkdir -p /pkgs \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         build-essential libssl-dev libffi-dev libsqlite3-dev \
+         zlib1g-dev libbz2-dev libreadline-dev libncurses-dev \
+         tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
+         libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+         libfreetype6-dev \
+    && JS_PACKAGE_MANIFEST=/javascript-packages.txt /package-init.sh \
+    && test -s /pkgs/.initialized \
+    && apt-get purge -y --auto-remove \
+         build-essential libssl-dev libffi-dev libsqlite3-dev \
+         zlib1g-dev libbz2-dev libreadline-dev libncurses-dev \
+         tk-dev libcurl4-openssl-dev libfontconfig1-dev \
+         libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+         libfreetype6-dev \
+    && rm -rf /var/lib/apt/lists/* /package-init.sh /javascript-packages.txt
+
+RUN mkdir -p /tmp/sandbox
+
+# Same hardening Stage 4 applies to the microVM guest rootfs. The guest here
+# is the whole image, so it applies to the whole image.
+RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
+RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
+         /usr/bin/perl* /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
+         /usr/local/bin/apt-install \
+         /usr/sbin/adduser /usr/sbin/useradd /usr/sbin/usermod \
+         /usr/sbin/groupadd /usr/sbin/groupmod \
+         /usr/bin/su \
+         /usr/bin/chfn /usr/bin/chsh /usr/bin/gpasswd /usr/bin/newgrp \
+         /usr/bin/passwd /usr/bin/sg \
+         /usr/bin/chage /usr/bin/expiry /usr/sbin/unix_chkpwd \
+    2>/dev/null || true
+
+COPY docker/start-sandbox-lambda-microvm.sh /usr/local/bin/start-sandbox.sh
+RUN chmod +x /usr/local/bin/start-sandbox.sh
+
+WORKDIR /
+EXPOSE 2000
+
+CMD ["/usr/local/bin/start-sandbox.sh"]
