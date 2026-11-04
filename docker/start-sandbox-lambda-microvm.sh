@@ -70,4 +70,48 @@ if [ "${SANDBOX_USE_CGROUPV2:-false}" = "true" ] && [ "$CGROUP_OK" != "true" ]; 
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# RLIMIT_NOFILE: raise the HARD limit so nsjail can grant jobs a real budget.
+# ---------------------------------------------------------------------------
+# The guest boots with a hard limit of 1024. nsjail sets RLIMIT_NOFILE per job
+# to SANDBOX_MAX_OPEN_FILES, and raising a hard limit needs CAP_SYS_RESOURCE,
+# which nsjail does not have. So SANDBOX_MAX_OPEN_FILES could never exceed
+# 1024 -- asking for more failed every execution before any code ran:
+#
+#   containSetLimits():188 util::setrlimit(0, RLIMIT_NOFILE, 2048):
+#       Operation not permitted
+#   runChild():551 Launching child process failed
+#
+# In cluster this never arose: launcher/src/main.rs raises the limit before
+# exec, and that launcher is not used on the MicroVM path (KVM_ENABLED=false).
+# This restores parity -- the in-cluster sandbox runs at soft 65536 /
+# hard 1048576.
+#
+# PID 1 here is root in the guest and the image declares
+# AdditionalOsCapabilities ALL, so CAP_SYS_RESOURCE should be available. It is
+# NOT assumed: the raise is best-effort and logged, exactly like the cgroup
+# steps above. If it fails the sandbox still starts, because
+# SANDBOX_MAX_OPEN_FILES stays at the old value until a separate change raises
+# it -- and that change must only land once the log line below confirms the
+# new hard limit. Raising both at once would reintroduce the failure above.
+#
+# The target is clamped to /proc/sys/fs/nr_open, the kernel ceiling a hard
+# limit cannot exceed.
+HARD_NOFILE_TARGET="${SANDBOX_HARD_NOFILE:-1048576}"
+NR_OPEN=$(cat /proc/sys/fs/nr_open 2>/dev/null || echo "")
+if [ -n "$NR_OPEN" ] && [ "$HARD_NOFILE_TARGET" -gt "$NR_OPEN" ] 2>/dev/null; then
+    echo "[sandbox] Clamping RLIMIT_NOFILE target $HARD_NOFILE_TARGET to kernel nr_open $NR_OPEN"
+    HARD_NOFILE_TARGET="$NR_OPEN"
+fi
+
+NOFILE_SOFT_BEFORE=$(ulimit -Sn 2>/dev/null || echo "?")
+NOFILE_HARD_BEFORE=$(ulimit -Hn 2>/dev/null || echo "?")
+
+if ulimit -n "$HARD_NOFILE_TARGET" 2>/dev/null; then
+    echo "[sandbox] Raised RLIMIT_NOFILE from ${NOFILE_SOFT_BEFORE}/${NOFILE_HARD_BEFORE} to $(ulimit -Sn)/$(ulimit -Hn)"
+else
+    echo "[sandbox] WARNING: could not raise RLIMIT_NOFILE above ${NOFILE_SOFT_BEFORE}/${NOFILE_HARD_BEFORE}" >&2
+    echo "[sandbox]          (CAP_SYS_RESOURCE unavailable). SANDBOX_MAX_OPEN_FILES must stay <= ${NOFILE_HARD_BEFORE}." >&2
+fi
+
 exec /sandbox_api/entrypoint.sh
