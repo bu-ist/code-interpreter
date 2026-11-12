@@ -1,7 +1,35 @@
 import client, { register, Counter, Histogram, Gauge } from 'prom-client';
 import { normalizeMetricPath } from './httpPathNormalize';
+import type { ExecutionProfile } from './execution-profile';
+import type { RuntimeSessionMode } from './types/service';
+import type { SandboxBackend } from './sandbox-backend/types';
 
 client.collectDefaultMetrics({ register });
+
+export const executionProfileInfo = new Gauge({
+  name: 'codeapi_execution_profile_info',
+  help: 'Static identity of this Code API execution deployment',
+  labelNames: ['profile', 'sandbox_backend', 'runtime_session_mode'] as const,
+});
+
+export function configureExecutionProfileMetrics(identity: {
+  profile: ExecutionProfile;
+  sandboxBackend: SandboxBackend['name'];
+  runtimeSessionMode: RuntimeSessionMode;
+}): void {
+  executionProfileInfo.reset();
+  executionProfileInfo.set({
+    profile: identity.profile,
+    sandbox_backend: identity.sandboxBackend,
+    runtime_session_mode: identity.runtimeSessionMode,
+  }, 1);
+}
+
+export const executionProfileRequestRejections = new Counter({
+  name: 'codeapi_execution_profile_request_rejections_total',
+  help: 'Requests rejected because the expected execution profile was invalid or mismatched',
+  labelNames: ['reason'] as const,
+});
 
 // -- HTTP metrics (shared across Express and Bun servers) --
 export const httpRequestsTotal = new Counter({
@@ -86,6 +114,12 @@ export const jobsCompleted = new Counter({
 export const jobsFailed = new Counter({
   name: 'codeapi_jobs_failed_total',
   help: 'Total number of jobs that failed',
+  labelNames: ['language'] as const,
+});
+
+export const jobsCancelled = new Counter({
+  name: 'codeapi_jobs_cancelled_total',
+  help: 'Total number of jobs cancelled after the calling client disconnected',
   labelNames: ['language'] as const,
 });
 
@@ -192,6 +226,57 @@ export const ptcReplayStateOversize = new Counter({
 export const ptcReplayStaleCleanups = new Counter({
   name: 'codeapi_ptc_replay_stale_cleanups_total',
   help: 'Stale executions reaped by the periodic cleanup sweep',
+});
+
+export const microvmLaunches = new Counter({
+  name: 'codeapi_microvm_launches_total',
+  help: 'Lambda MicroVM launch attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmLaunchDuration = new Histogram({
+  name: 'codeapi_microvm_launch_duration_seconds',
+  help: 'Time from RunMicrovm to a healthy RUNNING MicroVM',
+  buckets: [0.5, 1, 2, 5, 10, 20, 40, 60],
+});
+
+export const microvmTerminations = new Counter({
+  name: 'codeapi_microvm_terminations_total',
+  help: 'Lambda MicroVM terminations by reason',
+  labelNames: ['reason'] as const,
+});
+
+export const microvmThrottleEvents = new Counter({
+  name: 'codeapi_microvm_throttle_events_total',
+  help: 'Control-plane throttle waits/errors by operation',
+  labelNames: ['op'] as const,
+});
+
+export const runtimeSessionLockContention = new Counter({
+  name: 'codeapi_runtime_session_lock_contention_total',
+  help: 'Runtime session lock waits that timed out, by mode',
+  labelNames: ['mode'] as const,
+});
+
+export const microvmCheckpoints = new Counter({
+  name: 'codeapi_microvm_checkpoints_total',
+  help: 'Session workspace checkpoint attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmRestores = new Counter({
+  name: 'codeapi_microvm_restores_total',
+  help: 'Session workspace restore attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmCheckpointBytes = new Histogram({
+  name: 'codeapi_microvm_checkpoint_bytes',
+  help: 'Size of stored session workspace checkpoints',
+  buckets: [
+    1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024,
+    256 * 1024 * 1024, 512 * 1024 * 1024,
+  ],
 });
 
 // -- Helpers for serving metrics --

@@ -3,7 +3,7 @@ Package Init Job
 Runs as a Helm pre-install/pre-upgrade hook to populate the packages PVC
 with Python, Node, Bun, and Bash runtimes for the NsJail sandbox.
 */}}
-{{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.initJob.enabled }}
+{{- if and .Values.workerSandbox.enabled (eq (.Values.workerSandbox.packages.source | default "image") "pvc") .Values.workerSandbox.packages.initJob.enabled }}
 {{- $packageInitNodeSelector := .Values.workerSandbox.sandboxRunner.nodeSelector }}
 {{- $packageInitTolerations := .Values.workerSandbox.sandboxRunner.tolerations }}
 {{- if .Values.workerSandbox.sandboxRunner.inheritSharedScheduling }}
@@ -40,7 +40,8 @@ spec:
       containers:
         - name: package-init
           image: "{{ .Values.workerSandbox.packages.initJob.image.repository }}:{{ .Values.workerSandbox.packages.initJob.image.tag }}"
-          imagePullPolicy: {{ .Values.workerSandbox.packages.initJob.image.pullPolicy }}
+          {{/* Refresh cached latest images; preserve explicit offline Never. */}}
+          imagePullPolicy: {{ if and (eq (.Values.workerSandbox.packages.initJob.image.tag | toString) "latest") (ne .Values.workerSandbox.packages.initJob.image.pullPolicy "Never") }}Always{{ else }}{{ .Values.workerSandbox.packages.initJob.image.pullPolicy }}{{ end }}
           env:
             - name: PYTHON_VERSION
               value: {{ .Values.workerSandbox.packages.initJob.pythonVersion | quote }}

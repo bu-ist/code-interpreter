@@ -6,7 +6,9 @@ Deploy the horizontally-scalable Code Interpreter API stack to Kubernetes.
 
 - Docker Desktop with Kubernetes enabled, OR
 - Minikube installed (`brew install minikube` / `choco install minikube`)
-- Helm 3.x (`brew install helm` / `choco install kubernetes-helm`)
+- Helm >= 3.8 (`brew install helm` / `choco install kubernetes-helm`) — the
+  redis and minio subcharts are pulled from an OCI registry, which older Helm
+  releases only support behind an experimental flag
 - kubectl (`brew install kubectl` / `choco install kubernetes-cli`)
 
 ## Execution manifest signing keys (required)
@@ -53,6 +55,126 @@ platform rather than templated here: external ingress/service mesh, KEDA-style
 queue-depth autoscaling, and cloud-IAM secret delivery (the env hooks below
 cover all of them).
 
+**Prometheus scraping.** With `metrics.enabled=true` and
+`workerSandbox.enabled=true`, separate PodMonitors scrape the service-worker's `health` port and the sandbox-runner's
+`sandbox` port at `/metrics`. Only the latter exports
+`codeapi_sandbox_post_cleanup_*` metrics. Both inherit `metrics.interval` and
+`metrics.scrapeTimeout`. Install the Prometheus Operator PodMonitor CRD and
+configure Prometheus to discover this release's PodMonitors and namespace.
+
+The default NetworkPolicy allows runner ingress only from service-worker pods.
+To permit scraping with `networkPolicy.enabled=true`, explicitly match your
+trusted Prometheus namespace **and** pod labels in one peer, for example:
+
+```yaml
+metrics:
+  enabled: true
+  sandboxRunner:
+    ingressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: observability
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+```
+
+Replace the example labels with those of your scraper. The default empty list
+adds no access, even when metrics are enabled. This rule is rendered only while
+metrics and the worker/sandbox tier are enabled. It uses the configured runner
+port and does not change sandbox egress. Any policies on the Prometheus side
+must also allow the scrape connection. When chart network policies are disabled,
+allow scraping through your platform's policies instead.
+
+NetworkPolicy cannot restrict access to an HTTP path. These peers can reach the
+runner's execution endpoint as well, so do not use unrestricted peers such as
+`{}` or disable execution-manifest verification to enable scraping. No extra
+Service or externally exposed port is created. Chart upgrades do not modify
+runner images or require changes to stored session state for this scrape wiring.
+
+**Pairing-fence rollbacks.** Do not use a direct `helm rollback` from a chart
+revision containing the bridge pairing fence to an older revision. Helm runs
+rollback hooks from the target revision, so a pre-fence target cannot stop its
+own old and new API replicas from overlapping. Use the chart's fail-closed
+helper instead:
+
+```bash
+helm/codeapi/scripts/safe-pairing-rollback.sh RELEASE REVISION NAMESPACE
+```
+
+The helper records an out-of-band rollback epoch, deletes the API HPA, scales
+the live fenced API deployment to zero, verifies that the Deployment and every
+matching pod have converged to zero, and only then invokes `helm rollback`.
+When a fenced revision is deployed again, the epoch forces one fresh cleanup of
+legacy pairing codes even if the original migration window has expired. This
+causes an API outage by design. If rollback fails, the helper repeats the drain
+after re-discovering every API Deployment and explicitly deletes any remaining
+API pods, so a partially applied rollback cannot leave a mixed-version API
+running. The operator running it needs permission to read/scale Deployments,
+delete HPAs and pods, and create or update the rollback ConfigMap.
+Pass the intended cluster context to both `kubectl` and `helm` before invoking
+the helper; it rejects forwarded kubeconfig, context, identity, API-server, and
+namespace flags and Helm-specific target environment overrides so the drain and
+rollback cannot target different clusters. Termination signals during Helm
+also trigger a final recovery drain before the helper exits.
+
+**Execution profile.** By default this chart leaves
+`CODEAPI_EXECUTION_PROFILE` unset. Its bundled HTTP/stateless configuration is
+inferred as the AWS-free `default` profile and retains the existing
+`python-queue` / `other-queue` BullMQ names. Set `executionProfile: default`
+explicitly when deploying it beside a stateful stack. A separate stateful
+Lambda MicroVM deployment must use `executionProfile: stateful`; it then
+consumes `stateful-python-queue` / `stateful-other-queue`, so both stacks may
+safely share Redis without consuming each other's jobs. Do not mix API and
+worker profile values within one deployment.
+
+The chart does not provision Lambda MicroVM infrastructure. Supply its
+runtime settings to both the API and worker (and AWS credentials or workload
+identity to the worker) through the existing environment hooks, for example:
+
+```yaml
+executionProfile: stateful
+api:
+  extraEnv:
+    - name: CODEAPI_RUNTIME_SESSION_MODE
+      value: affinity
+workerSandbox:
+  extraEnv:
+    - name: CODEAPI_SANDBOX_BACKEND
+      value: lambda-microvm
+    - name: CODEAPI_RUNTIME_SESSION_MODE
+      value: affinity
+    - name: LAMBDA_MICROVM_IMAGE_ARN
+      value: arn:aws:lambda:REGION:ACCOUNT:microvm-image:NAME
+    - name: LAMBDA_MICROVM_IMAGE_VERSION
+      value: "VERSION"
+```
+
+The worker also needs the remaining Lambda networking, checkpoint-store, and
+hardening variables documented in `docs/lambda-microvm/README.md`. This chart
+still renders its bundled sandbox-runner, though a Lambda worker does not call
+it; a platform-specific stateful deployment may omit that component.
+
+Resident hosted apps are an opt-in capability of that stateful deployment.
+Configure `CODEAPI_HOSTED_APPS_ENABLED`, the preview origin, and both hosted-app
+keys through `api.extraEnv`; configure only the feature flag and credential key
+on `workerSandbox.extraEnv`, along with the dedicated app image settings.
+Wildcard DNS and TLS for the preview origin must route to the API service
+separately from the normal CodeAPI host. See “Hosted-app control plane and preview gateway” in
+`docs/lambda-microvm/README.md`; do not serve previews beneath the privileged
+LibreChat/CodeAPI origin.
+
+For an existing affinity/strict deployment from before execution profiles,
+first roll the new binary to API and worker pods with
+`CODEAPI_EXECUTION_PROFILE` still unset. The inferred stateful compatibility
+mode deliberately retains the legacy queues, so old and new binaries can
+overlap. Then create a replacement deployment with the profile explicitly set
+to `stateful`, verify its API and workers together, switch the stateful ingress,
+and drain the legacy deployment. Roll back by switching ingress to the legacy
+deployment before removing the replacement. Never share Redis between the
+inferred compatibility deployment and a default deployment: both consume the
+legacy queues.
+
 **Authentication.** Outside local mode the API verifies JWTs. Configure the
 verifier through environment variables on the api component, e.g.:
 
@@ -78,6 +200,30 @@ For development only, `LOCAL_MODE=true` bypasses authentication — see
 **TLS to Redis.** Set `REDIS_TLS=true` via `extraEnv` on each component when
 your Redis (e.g. a managed cache) requires TLS.
 
+**Package delivery.** KVM deployments default to
+`workerSandbox.packages.source=image`. Build and publish the baked runner target
+under the existing `workerSandbox.sandboxImage` repository and tag:
+
+```bash
+docker build \
+  --target sandbox-runner-baked \
+  -t codeapi-sandbox-runner:latest \
+  -f api/Dockerfile .
+```
+
+That image boots the guest and its `/pkgs` tree from a read-only ext4 block
+image. It intentionally does not expose `/host-packages` through virtio-fs,
+which prevents package imports from pinning host-side launcher file
+descriptors. Set `workerSandbox.packages.source=pvc` only for compatibility with
+runtime package rebuilds; Kubernetes will then use the FD-aware liveness probe
+to recycle the runner before descriptor exhaustion.
+
+When upgrading from chart 0.2.x, rebuild the configured `sandboxImage` from the
+baked target before enabling the 0.3.x default. To keep an existing
+directory-root image during migration, set
+`workerSandbox.packages.source=pvc`; the established image repository/tag
+override remains unchanged in either mode.
+
 ## Quick Start (Local Development)
 
 ### 1. Start Minikube
@@ -93,7 +239,7 @@ eval $(minikube docker-env)
 # Build all images, from the codeapi root
 docker build -t codeapi-api:latest -f service/Dockerfile.api .
 docker build -t codeapi-worker:latest -f service/Dockerfile.worker .
-docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
+docker build --target sandbox-runner -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 docker build -t codeapi-file-server:latest -f service/Dockerfile --target production .
 docker build -t codeapi-tool-call-server:latest -f service/Dockerfile.tool-call-server --target production .
 docker build -t codeapi-package-init:latest -f docker/Dockerfile.package-init .
@@ -113,9 +259,13 @@ helm dependency update
 helm install codeapi . -f values-local.yaml
 ```
 
-### 4. Language Packages (Automatic)
+### 4. Language Packages (Local PVC Mode)
 
-The chart includes a **package-init Job** that runs as a Helm `pre-install` hook. It automatically compiles Python, downloads Node/Bun, installs offline package sets, and registers Bash into the packages PVC before the worker pods start.
+`values-local.yaml` disables KVM and selects the legacy PVC package source. In
+that mode the chart includes a **package-init Job** that runs as a Helm
+`pre-install` hook. It compiles Python, downloads Node/Bun, installs offline
+package sets, and registers Bash into the packages PVC before the worker pods
+start.
 
 This happens automatically on `helm install`. To force a rebuild:
 
@@ -168,7 +318,7 @@ curl http://localhost:3112/v1/health
 # Start minikube
 minikube start
 
-# Deploy (package-init job runs automatically)
+# Deploy local direct mode (package-init job runs automatically)
 helm install codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml
 
 # Port forward
@@ -204,7 +354,7 @@ helm upgrade codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml \
 # Rebuild images (must be in minikube docker env)
 eval $(minikube docker-env)
 docker build -t codeapi-worker:latest -f service/Dockerfile.worker .
-docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
+docker build --target sandbox-runner -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 
 # Restart deployments to pick up new images
 kubectl rollout restart deployment/codeapi-service-worker
@@ -285,9 +435,9 @@ kubectl logs deployment/codeapi-service-worker --tail=5
 |  +--------------+  +--------------+  +--------------+                |
 |                                                                      |
 |  +---------------------------------------------------------------+   |
-|  |              PersistentVolume (Packages)                       |   |
-|  |  /pkgs - Python, Node, Bun runtimes                            |   |
-|  |  ReadOnlyMany - shared across all sandbox-runner pods          |   |
+|  |                 Package delivery                               |   |
+|  |  KVM default: /pkgs in each baked ext4 block-root image        |   |
+|  |  Direct mode: shared package PVC populated by package-init     |   |
 |  +---------------------------------------------------------------+   |
 |                                                                      |
 |  Total sandbox capacity: 3 pods x 8 concurrent jobs = 24 jobs        |
@@ -315,7 +465,7 @@ kubectl describe pod <pod-name>
 
 ### "runtime is unknown" error
 ```bash
-# Language packages PVC is empty. Check if the init job ran:
+# In source=pvc mode, check whether the package-init job populated the PVC:
 kubectl get jobs -l app.kubernetes.io/component=package-init
 kubectl logs job/codeapi-package-init
 
@@ -325,6 +475,10 @@ helm upgrade codeapi . --set workerSandbox.packages.initJob.forceRebuild=true
 # Then restart sandbox-runner pods
 kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
+
+In the default `source=image` mode, rebuild and publish
+`workerSandbox.sandboxImage` from the `sandbox-runner-baked` target instead; no
+package-init Job or packages PVC is rendered.
 
 ### Connection refused on port 3112
 ```bash

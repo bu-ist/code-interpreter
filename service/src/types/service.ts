@@ -3,6 +3,10 @@ import type { Request } from 'express';
 import type { ExecutionManifestClaims } from '../execution-manifest';
 import type { ExecutionIdentity } from '../execution-identity';
 import type { CodeApiPrincipal } from '../auth/principal';
+import type {
+    ExecutionProfile,
+    SandboxBackendName,
+} from '../execution-profile';
 import { Jobs } from '@/enum/service';
 
 /**
@@ -102,6 +106,23 @@ export type RequestFile = {
 
 export type FileRefs = FileRef[];
 
+export interface ArtifactDeliveryFailure {
+  code: 'artifact_delivery_failed';
+  status: 'partial' | 'failed';
+  attempted: number;
+  delivered: number;
+  failed: number;
+}
+
+export type ArtifactTruncationReason = 'max_files' | 'depth' | 'size' | 'path' | 'unreadable';
+
+export interface ArtifactTruncation {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  skipped: string[];
+  skipped_count: number;
+}
+
 export type ExecuteResponse = {
   run?: {
     stdout: string;
@@ -120,17 +141,33 @@ export type ExecuteResponse = {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRefs;
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 };
 
 export interface RequestBody {
+  /** Optional positive runtime cap in milliseconds, clamped to JOB_TIMEOUT. */
+  timeout?: number;
   code: string;
   lang: string;
   args?: string[];
   user_id?: string;
   files?: RequestFile[];
+  /**
+   * Optional stable identity hint (e.g. conversation id) for stateful
+   * runtime sessions. Never a security boundary: the server derives the
+   * final runtime session id as hash(tenant, user, hint). Ignored when
+   * CODEAPI_RUNTIME_SESSION_MODE is `stateless`.
+   */
+  runtime_session_hint?: string;
 }
 
-export type CreatePayload = { req: AuthenticatedRequest, session_id: string; isPyPlot?: boolean };
+export type CreatePayload = {
+    req: AuthenticatedRequest;
+    session_id: string;
+    isPyPlot?: boolean;
+};
 export interface FileObject {
   name: string;
   id: string;
@@ -141,19 +178,44 @@ export interface FileObject {
   size?: number;
   lastModified?: string;
   etag?: string;
-  metadata?: {
+    metadata?:
+        | {
     'content-type': string;
     'original-filename': string;
-  } | undefined;
+          }
+        | undefined;
   versionId?: string | null;
   contentType?: string;
 }
 
 export type PayloadFile = { name: string; content: string };
+export type PayloadFileRef = {
+  id: string;
+  storage_session_id: string;
+  name: string;
+  /**
+   * Stable opaque identity for runner-local input caching. The worker derives
+   * it from the authorized raw ref before hardened egress replaces the raw
+   * identifiers with per-grant handles.
+   */
+  input_cache_key?: string;
+};
 
 export interface PayloadBody {
   language: string;
   version: string;
+  /** Opaque conversation checkout selected and authenticated by the API. */
+  workspace_instance_id?: string;
+  /** Linked worktree lane at `.worktrees/<name>` beneath the selected checkout. */
+  workspace_worktree?: string;
+    /** Stable identity shared by all replay iterations of one execution. */
+    execution_id?: string;
+    replay_tool_count?: number;
+    /** Manifest-bound upload ceiling exposed to remote workers. */
+    max_output_files?: number;
+    /** Effective per-file ceiling after manifest and gateway policy intersect. */
+    max_output_file_bytes?: number;
+    transfer_timeout_ms?: number;
   run_memory_limit?: number;
   run_timeout?: number;
   run_cpu_time?: number;
@@ -163,7 +225,7 @@ export interface PayloadBody {
    * are sessionKey-derivation inputs at the service entry, never
    * consumed by the sandbox, so they're intentionally not on this
    * shape. */
-  files: Array<PayloadFile | { id: string; storage_session_id: string; name: string }>;
+  files: Array<PayloadFile | PayloadFileRef>;
   /** Top-level execution session id (passed to sandbox to seed Job.uuid). */
   session_id?: string;
   /** Output storage session id/handle used for generated file uploads. */
@@ -202,11 +264,16 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files: FileRefs;
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   code?: number | null;
   signal?: string | null;
   message?: string | null;
   status?: string | null;
   wall_time?: number | null;
+    /** Trusted worker control channel; avoids losing replay calls to stdout truncation. */
+    pending_tool_calls_payload?: string;
 };
 
 export interface LanguageConfig {
@@ -215,6 +282,11 @@ export interface LanguageConfig {
   fileName: string;
   runtime?: string;
 }
+
+export type RuntimeSessionMode = 'stateless' | 'affinity' | 'strict';
+
+/** Explicit reasons a queue job may remain stateless in a stateful mode. */
+export type RuntimeSessionExemption = 'programmatic';
 
 export type JobData = {
   code: string;
@@ -227,6 +299,38 @@ export type JobData = {
   executionId?: string;
   tenantId?: string;
   canonicalUserId?: string;
+  /** Trusted dynamic outbound worker selection. */
+  bridgeWorkerId?: string;
+  /** Trusted selected workspace for native replay-mode PTC. */
+  workspaceId?: string;
+  /** Opts replay jobs into durable client-disconnect cancellation. */
+  cancellable?: boolean;
+  /** Absolute producer budget; queue-worker configuration may only tighten it. */
+  deadlineAtMs?: number;
+  /** Producer request tombstones must never outlive the completion decision. */
+  cancellationTtlSeconds?: number;
+  /** Producer deployment identity. Optional only for pre-profile queued jobs. */
+  executionProfile?: ExecutionProfile;
+  /** Required sandbox transport. Optional only for jobs queued before fencing. */
+  sandboxBackend?: SandboxBackendName;
+  /**
+   * Server-derived runtime session identity. Absence is stateless unless
+   * strict mode requires it; explicit exemptions document intentional gaps.
+   */
+  runtimeSessionId?: string;
+  /**
+   * Producer-owned effective execution mode. This crosses the BullMQ boundary
+   * so API/worker rollout skew cannot reinterpret a stateful job as stateless
+   * (or reject an intentional stateless fallback). Optional only for queued
+   * jobs created before this field existed; workers infer those from the
+   * presence of runtimeSessionId.
+   */
+  runtimeSessionMode?: RuntimeSessionMode;
+  /**
+   * Intentional stateless exception. Programmatic/replay execution externalizes
+   * continuation state and does not yet bind PTC rounds to a warm session.
+   */
+  runtimeSessionExemption?: RuntimeSessionExemption;
   executionManifestClaims?: ExecutionManifestClaims;
   /** Raw grant claims retained only for service-worker dispatch so grant
    * expiry is anchored to sandbox start, not BullMQ enqueue time. */
@@ -293,6 +397,10 @@ export interface ProgrammaticRequestBody {
    * legacy `/exec` sandbox body), so the router accepts either key and
    * normalizes to `language`. If both are present, `language` wins. */
   lang?: 'python' | 'bash';
+  /** Opaque conversation checkout binding for a selected native workspace. */
+  workspace_instance_id?: string;
+  /** Linked worktree lane at `.worktrees/<name>` beneath the selected checkout. */
+  workspace_worktree?: string;
 }
 
 export interface ProgrammaticToolCall {
@@ -310,6 +418,9 @@ export interface ProgrammaticResponse {
   stdout?: string;
   stderr?: string;
   files?: FileRefs;
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Top-level execution session id (one sandbox PTC invocation). */
   session_id?: string;
   tool_calls_made?: number;

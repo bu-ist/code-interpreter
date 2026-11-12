@@ -28,15 +28,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
-    && git checkout dccf911fd2659e7b08ce9507c25b2b38ec2c5800
+    && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
+    && git submodule update --init --recursive
 
-RUN make -j$(nproc)
+COPY docker/nsjail-anonymous-control.patch /tmp/nsjail-anonymous-control.patch
+# Network-isolated jobs need no libnl transport; removing it avoids sendmsg
+# in the supervisor and fails closed for interface/traffic-rule configuration.
+RUN git apply /tmp/nsjail-anonymous-control.patch && make -j$(nproc) NL3_EXISTS=no
 
 COPY api/src/spec-guard.c /tmp/spec-guard.c
-RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
-    && chmod 0111 /usr/local/bin/spec-guard
+COPY api/src/tool-call-pipe-bridge.c /tmp/tool-call-pipe-bridge.c
+COPY api/src/anonymous-pipes.c /tmp/anonymous-pipes.c
+COPY api/src/supervisor-policy.c /tmp/supervisor-policy.c
+COPY --from=node:22.23.4-slim /usr/local/include/node /usr/local/include/node
+COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
+RUN gcc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/local/include/node -o /usr/local/lib/anonymous-pipes.node /tmp/anonymous-pipes.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-supervisor-policy /tmp/supervisor-policy.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/tool-call-pipe-bridge /tmp/tool-call-pipe-bridge.c \
+    && gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
+    && gcc -O2 -static -o /usr/local/bin/sandbox-rootfs-setup /tmp/rootfs-setup.c \
+    && chmod 0111 /usr/local/bin/spec-guard /usr/local/bin/sandbox-rootfs-setup
 
-FROM oven/bun:1.3.14-debian AS sandbox-build
+FROM oven/bun:1.4.4-debian AS sandbox-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -62,12 +75,17 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+COPY --from=nsjail-builder /usr/local/bin/tool-call-pipe-bridge /usr/local/bin/tool-call-pipe-bridge
+COPY --from=nsjail-builder /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/sandbox-supervisor-policy
+COPY --from=nsjail-builder /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
 RUN chmod +x /usr/sbin/nsjail
 
 WORKDIR /sandbox_api
 
-COPY api/package.json ./
-RUN bun install
+COPY api/package.json api/bun.lock ./
+RUN bun ci
 
 COPY api/tsconfig.json ./
 COPY api/src ./src
@@ -91,6 +109,7 @@ RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
     2>/dev/null || true
 
 COPY api/src/entrypoint.sh ./entrypoint.sh
+COPY api/src/guest-dns.sh ./guest-dns.sh
 RUN chmod +x ./entrypoint.sh
 
 # ============================================================================
@@ -126,16 +145,18 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     && dnf clean all
 
 COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
+COPY --from=nsjail-builder /usr/local/bin/sandbox-rootfs-setup /sandbox-rootfs-setup
 
 COPY --from=sandbox-build / /sandbox-rootfs/
 
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && bash /sandbox-rootfs/sandbox_api/guest-dns.sh --prepare-rootfs /sandbox-rootfs
 
 RUN mkdir -p /host-packages
 
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
 COPY docker/sandbox-entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /sandbox-rootfs-setup /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

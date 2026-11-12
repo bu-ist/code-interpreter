@@ -26,11 +26,31 @@ RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
     && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
     && git submodule update --init --recursive
 
-RUN make -j$(nproc)
+COPY docker/nsjail-anonymous-control.patch /tmp/nsjail-anonymous-control.patch
+# Network-isolated jobs need no libnl transport; removing it avoids sendmsg
+# in the supervisor and fails closed for interface/traffic-rule configuration.
+RUN git apply /tmp/nsjail-anonymous-control.patch && make -j$(nproc) NL3_EXISTS=no
 
 COPY api/src/spec-guard.c /tmp/spec-guard.c
-RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
-    && chmod 0111 /usr/local/bin/spec-guard
+COPY api/src/tool-call-pipe-bridge.c /tmp/tool-call-pipe-bridge.c
+COPY api/src/anonymous-pipes.c /tmp/anonymous-pipes.c
+COPY api/src/supervisor-policy.c /tmp/supervisor-policy.c
+COPY --from=node:22.23.4-slim /usr/local/include/node /usr/local/include/node
+COPY docker/rootfs-setup.c /tmp/rootfs-setup.c
+RUN gcc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/local/include/node -o /usr/local/lib/anonymous-pipes.node /tmp/anonymous-pipes.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-supervisor-policy /tmp/supervisor-policy.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/tool-call-pipe-bridge /tmp/tool-call-pipe-bridge.c \
+    && gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
+    && gcc -O2 -static -o /usr/local/bin/sandbox-rootfs-setup /tmp/rootfs-setup.c \
+    && chmod 0111 /usr/local/bin/spec-guard /usr/local/bin/sandbox-rootfs-setup
+
+# Native policy/transport verification without building the full runner.
+FROM nsjail-builder AS nsjail-ipc-test
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
+COPY docker/python-runtime /python-runtime
+RUN python3 /python-runtime/install.py
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=oven/bun:1.4.4-debian /usr/local/bin/bun /usr/local/bin/bun
 
 # ============================================================================
 # Stage 1b: Build language runtime packages (only consumed by sandbox-runner-baked)
@@ -44,7 +64,7 @@ FROM buildpack-deps:bookworm AS package-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHON_VERSION=3.14.4
-ENV BUN_VERSION=1.3.14
+ENV BUN_VERSION=1.4.4
 
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
@@ -59,6 +79,7 @@ RUN apt-install \
 
 RUN mkdir -p /pkgs
 
+COPY docker/python-runtime /python-runtime
 COPY docker/package-init.sh /package-init.sh
 COPY javascript-packages.txt /javascript-packages.txt
 RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
@@ -66,7 +87,7 @@ RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
 # ============================================================================
 # Stage 2: Build sandbox rootfs
 # ============================================================================
-FROM oven/bun:1.3.14-debian AS sandbox-build
+FROM oven/bun:1.4.4-debian AS sandbox-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -108,21 +129,21 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+COPY --from=nsjail-builder /usr/local/bin/tool-call-pipe-bridge /usr/local/bin/tool-call-pipe-bridge
+COPY --from=nsjail-builder /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/sandbox-supervisor-policy
+COPY --from=nsjail-builder /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 RUN chmod +x /usr/sbin/nsjail
 
-# The tool-call socket proxy must run under Node, not Bun. Bun's node:http
-# compat layer never fires `'connection'` events and Bun.serve's idleTimeout
-# does not close silent unix-socket connections — so our DoS protections
-# (maxConnections, idleSocketTimeoutMs, accept-time tracking) silently no-op
-# under Bun and a `for i in range(N): socket.connect` storm pins FDs in the
-# proxy until the OS limit. Pulling just the Node binary from a slim image
+# The per-invocation broker starts Node after restore, so its OpenSSL process
+# state is not captured in the MicroVM snapshot. Pulling the Node binary
 # is ~30 MB and avoids inheriting npm/node_modules from a full apt install.
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22.23.4-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 
-COPY api/package.json ./
-RUN bun install
+COPY api/package.json api/bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY api/tsconfig.json ./
 COPY api/src ./src
@@ -146,7 +167,58 @@ RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
     2>/dev/null || true
 
 COPY api/src/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
+COPY api/src/guest-dns.sh ./guest-dns.sh
+COPY api/src/hosted-app-launcher.sh /usr/local/bin/codeapi-hosted-app-launcher
+RUN chmod +x ./entrypoint.sh /usr/local/bin/codeapi-hosted-app-launcher
+
+# ============================================================================
+# Stage 2b: AWS Lambda MicroVM container base image
+#
+# Lambda MicroVM IS the VM boundary: no libkrun launcher, no guest kernel.
+# This target is pushed to a same-account ECR repo and referenced by the
+# FROM line of the code-artifact Dockerfile that Lambda builds on top of
+# the AL2023 MicroVM base image (see scripts/build-lambda-microvm-artifact.sh).
+# Inbound traffic defaults to port 8080; lifecycle/build hooks are served
+# by the same app at /aws/lambda-microvms/runtime/v1/*.
+# ============================================================================
+FROM sandbox-build AS lambda-microvm-runner
+
+COPY --from=package-builder /pkgs /pkgs
+
+ENV PORT=8080 \
+    SANDBOX_PACKAGES_DIRECTORY=/pkgs \
+    SANDBOX_SESSION_WORKSPACE_ENABLED=true
+
+EXPOSE 8080/tcp
+ENTRYPOINT ["/sandbox_api/entrypoint.sh"]
+
+# Local direct-NsJail runtime used by @librechat/code's Docker supervisor.
+# Runtime packages are mounted read-only at /pkgs, matching docker-compose.mac.
+# This profile shares the Docker Desktop VM kernel and is for operator-trusted
+# local/BYOM development; production untrusted execution should retain the
+# separate MicroVM boundary described in the repository security guidance.
+FROM sandbox-build AS local-oci-runtime
+
+ENV PORT=2000 \
+    SANDBOX_PACKAGES_DIRECTORY=/pkgs \
+    SANDBOX_OUTPUT_MAX_SIZE=65536 \
+    SANDBOX_SESSION_WORKSPACE_ENABLED=true \
+    SANDBOX_USE_CGROUPV2=false \
+    SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP=false
+
+EXPOSE 2000/tcp
+ENTRYPOINT ["/sandbox_api/entrypoint.sh"]
+
+# Dedicated resident-process host. This image deliberately keeps the runner
+# control listener on 8080 and exposes one fixed user-app port separately.
+# `/execute` is disabled when hosted-app mode is enabled; the control plane
+# restores a checkpoint and starts the app through `/api/v2/hosted-app/start`.
+FROM lambda-microvm-runner AS lambda-microvm-app-host
+
+ENV SANDBOX_HOSTED_APPS_ENABLED=true \
+    SANDBOX_HOSTED_APP_PORT=3000
+
+EXPOSE 3000/tcp
 
 # ============================================================================
 # Stage 3: Build the Rust launcher binary (Fedora for libkrun ABI)
@@ -170,10 +242,12 @@ RUN cargo build --release
 #
 # Split into:
 #   - sandbox-runner-base : everything except the guest rootfs copy
-#   - sandbox-runner      : default target; copies rootfs without packages
-#                           (packages come from a runtime PVC mount)
+#   - sandbox-runner      : legacy/direct target; copies rootfs without
+#                           packages (packages come from a runtime PVC mount)
 #   - sandbox-runner-baked: copies rootfs AND bakes /pkgs from package-builder
 #                           (no PVC needed; runner can spread across nodes)
+#   - sandbox-runner-{true,false}: Compose aliases selected by KVM_ENABLED
+#   - sandbox-runner-default: final alias for the safe baked KVM image
 # ============================================================================
 FROM fedora:43 AS sandbox-runner-base
 
@@ -189,6 +263,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     && dnf clean all
 
 COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
+COPY --from=nsjail-builder /usr/local/bin/sandbox-rootfs-setup /sandbox-rootfs-setup
 
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
@@ -211,7 +286,8 @@ COPY --from=sandbox-build / /sandbox-rootfs/
 COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
 COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
 
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && bash /sandbox-rootfs/sandbox_api/guest-dns.sh --prepare-rootfs /sandbox-rootfs
 RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
     && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
 
@@ -229,6 +305,16 @@ FROM sandbox-runner-base AS sandbox-runner
 
 COPY --from=sandbox-build / /sandbox-rootfs/
 
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && bash /sandbox-rootfs/sandbox_api/guest-dns.sh --prepare-rootfs /sandbox-rootfs
 
 RUN mkdir -p /host-packages
+
+# Compose derives these aliases from KVM_ENABLED so existing no-KVM overrides
+# keep selecting the directory-root image automatically.
+FROM sandbox-runner-baked AS sandbox-runner-true
+FROM sandbox-runner AS sandbox-runner-false
+
+# Keep the safe KVM image as the Dockerfile default. Direct NsJail and legacy
+# virtio-fs deployments can still select --target sandbox-runner explicitly.
+FROM sandbox-runner-true AS sandbox-runner-default

@@ -174,6 +174,24 @@ test_statsmodels() {
     fi
 }
 
+test_geospatial() {
+    log_info "Testing geospatial stack import and reprojection..."
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import geopandas as gpd\nimport rasterio\nfrom shapely.geometry import Point\ngdf = gpd.GeoDataFrame(geometry=[Point(-74.006, 40.7128)], crs=\"EPSG:4326\").to_crs(\"EPSG:26918\")\nprint(round(float(gdf.geometry.iloc[0].x), 2))"}]}')
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    code=$(echo "$result" | jq -r '.run.code // empty')
+    easting=$(echo "$stdout" | head -1 | tr -d '\r')
+    if [[ "$code" == "0" ]] && [[ "$easting" =~ ^[0-9]+(\.[0-9]+)?$ ]] &&
+        awk -v e="$easting" 'BEGIN { exit !(e > 100000 && e < 900000) }'; then
+        log_success "geospatial: UTM 18N easting '$easting'"
+        return 0
+    else
+        log_error "geospatial: expected UTM 18N easting in 100000..900000 with exit 0, got code='$code' stdout='$stdout'"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_chdb() {
     log_info "Testing chDB import and query..."
     result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import chdb\nprint(chdb.query(\"SELECT sum(number) FROM numbers(5)\", \"CSV\"))"}]}')
@@ -268,14 +286,27 @@ expect_socket_blocked("AF_RXRPC", getattr(socket, "AF_RXRPC", 33), socket.SOCK_D
 expect_socket_blocked("AF_ALG", getattr(socket, "AF_ALG", 38), socket.SOCK_SEQPACKET, 0)
 
 syscalls = {
-    "x86_64": {"clone": 56, "clone3": 435, "vmsplice": 278},
-    "amd64": {"clone": 56, "clone3": 435, "vmsplice": 278},
-    "aarch64": {"clone": 220, "clone3": 435, "vmsplice": 75},
-    "arm64": {"clone": 220, "clone3": 435, "vmsplice": 75},
+    "x86_64": {"clone": 56, "clone3": 435, "vmsplice": 278, "futex": 202},
+    "amd64": {"clone": 56, "clone3": 435, "vmsplice": 278, "futex": 202},
+    "aarch64": {"clone": 220, "clone3": 435, "vmsplice": 75, "futex": 98},
+    "arm64": {"clone": 220, "clone3": 435, "vmsplice": 75, "futex": 98},
 }
 arch = platform.machine().lower()
 if arch not in syscalls:
     raise SystemExit(f"unsupported arch for syscall smoke test: {arch}")
+
+# PI operations must be denied before the kernel sees even invalid addresses.
+for command in (6, 7, 8, 11, 12, 13):
+    for flags in (0, 128, 256, 384):
+        ctypes.set_errno(0)
+        rc = libc.syscall(syscalls[arch]["futex"], 0, command | flags, 0, 0, 0, 0)
+        if rc != -1 or ctypes.get_errno() != errno.EPERM:
+            raise SystemExit(f"PI futex operation was not denied: {command | flags}")
+word = ctypes.c_int(0)
+rc = libc.syscall(syscalls[arch]["futex"], ctypes.byref(word), 1 | 128, 1, 0, 0, 0)
+if rc != 0:
+    raise SystemExit("ordinary FUTEX_WAKE_PRIVATE was blocked")
+print("futex_pi=blocked:ordinary_wake=ok")
 
 CLONE_NEWUSER = 0x10000000
 CLONE_NEWNET = 0x40000000
@@ -341,7 +372,8 @@ PY
         && [[ "$stdout" == *"AF_ALG=errno:1"* ]] \
         && [[ "$stdout" == *"clone_namespace=rc:-1:errno:1"* ]] \
         && [[ "$stdout" == *"clone3=rc:-1:errno:38"* ]] \
-        && [[ "$stdout" == *"vmsplice=rc:-1:errno:1"* ]]; then
+        && [[ "$stdout" == *"vmsplice=rc:-1:errno:1"* ]] \
+        && [[ "$stdout" == *"futex_pi=blocked:ordinary_wake=ok"* ]]; then
         log_success "Kernel attack-surface syscalls blocked"
         return 0
     else
@@ -400,6 +432,7 @@ FAILED=0
 test_basic_python || FAILED=$((FAILED + 1))
 test_numpy || FAILED=$((FAILED + 1))
 test_statsmodels || FAILED=$((FAILED + 1))
+test_geospatial || FAILED=$((FAILED + 1))
 test_chdb || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))

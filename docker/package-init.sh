@@ -13,8 +13,15 @@ FORCE_REBUILD="${FORCE_REBUILD:-false}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 PYTHON_SITE_VERSION="${PYTHON_VERSION%.*}"
 PYTHON_ALIAS="python${PYTHON_SITE_VERSION}"
-NODE_VERSION="${NODE_VERSION:-24.15.0}"
-BUN_VERSION="${BUN_VERSION:-1.3.14}"
+# "uv" (default) installs the Python package list noticeably faster than pip.
+# Set to "pip" to use the previous behavior. Like any unpinned "latest
+# compatible" install, the exact resolved versions can differ run to run (and
+# between installers) for packages with no version constraint in the list
+# below — that's inherent to installing unpinned packages, not specific to uv.
+PYTHON_PACKAGE_INSTALLER="${PYTHON_PACKAGE_INSTALLER:-uv}"
+UV_VERSION="${UV_VERSION:-0.11.26}"
+NODE_VERSION="${NODE_VERSION:-24.22.1}"
+BUN_VERSION="${BUN_VERSION:-1.4.4}"
 BASH_PACKAGE_VERSION="${BASH_PACKAGE_VERSION:-5.2.0}"
 INSTALL_FAILED=false
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
@@ -80,11 +87,13 @@ echo "=============================================="
 echo ""
 
 packages_ready() {
+    [ -f "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/.sandbox-pipe-runtime-v1" ] &&
     [ -f "/pkgs/python/${PYTHON_VERSION}/.package-installed" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/PIL" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/markitdown" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/chdb" ] &&
     [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/statsmodels" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/rasterio" ] &&
     [ -f "/pkgs/node/${NODE_VERSION}/.package-installed" ] &&
     js_packages_ready "/pkgs/node/${NODE_VERSION}" &&
     [ -f "/pkgs/bun/${BUN_VERSION}/.package-installed" ] &&
@@ -92,8 +101,64 @@ packages_ready() {
     [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ]
 }
 
+write_node_launcher() {
+    local destination="$1"
+    local launcher
+    launcher="$(mktemp "${destination}/.run.XXXXXX")"
+    cat > "$launcher" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE_DIR="${SCRIPT_DIR}/node_modules"
+if [ -d "$MODULE_DIR" ]; then
+    if [ -L /mnt/data/node_modules ]; then
+        LINK_TARGET="$(readlink -m /mnt/data/node_modules)"
+        if [ "$LINK_TARGET" != "$MODULE_DIR" ]; then
+            case "$LINK_TARGET" in
+                "${SCRIPT_DIR%/*/*}/"*/node_modules)
+                    ln -sfnT "$MODULE_DIR" /mnt/data/node_modules ;;
+            esac
+        fi
+    elif [ ! -e /mnt/data/node_modules ]; then
+        ln -s "$MODULE_DIR" /mnt/data/node_modules 2>/dev/null || true
+    fi
+fi
+"${SCRIPT_DIR}/bin/node" "$@"
+EOF
+    chmod 0755 "$launcher"
+    mv -f "$launcher" "${destination}/run"
+}
+
+write_bun_launcher() {
+    local destination="$1"
+    local launcher
+    launcher="$(mktemp "${destination}/.run.XXXXXX")"
+    cat > "$launcher" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE_DIR="${SCRIPT_DIR}/node_modules"
+if [ -d "$MODULE_DIR" ]; then
+    if [ -L /mnt/data/node_modules ]; then
+        LINK_TARGET="$(readlink -m /mnt/data/node_modules)"
+        if [ "$LINK_TARGET" != "$MODULE_DIR" ]; then
+            case "$LINK_TARGET" in
+                "${SCRIPT_DIR%/*/*}/"*/node_modules)
+                    ln -sfnT "$MODULE_DIR" /mnt/data/node_modules ;;
+            esac
+        fi
+    elif [ ! -e /mnt/data/node_modules ]; then
+        ln -s "$MODULE_DIR" /mnt/data/node_modules 2>/dev/null || true
+    fi
+fi
+"${SCRIPT_DIR}/bun" run "$@"
+EOF
+    chmod 0755 "$launcher"
+    mv -f "$launcher" "${destination}/run"
+}
+
 if [ -f "$MARKER_FILE" ] && [ "$FORCE_REBUILD" != "true" ]; then
     if packages_ready; then
+        write_node_launcher "/pkgs/node/${NODE_VERSION}"
+        write_bun_launcher "/pkgs/bun/${BUN_VERSION}"
         echo "Packages already initialized (marker file exists)"
         echo "Set FORCE_REBUILD=true to force reinstall"
         echo ""
@@ -130,6 +195,7 @@ cd "Python-${PYTHON_VERSION}"
 ./configure --prefix="$PKG_DEST" --enable-optimizations 2>/dev/null
 make -j$(nproc)
 make install
+"${PKG_DEST}/bin/python3" "${SCRIPT_DIR}/python-runtime/install.py"
 cd /tmp
 rm -rf /tmp/Python-${PYTHON_VERSION}*
 
@@ -167,10 +233,16 @@ if [ -f "$PIP_PATH" ]; then
     "$PIP_PATH" install --upgrade pip 2>/dev/null || true
     PYTHON_PACKAGES_INSTALLED=false
 
+    PYTHON_INSTALL_CMD=("$PIP_PATH" install)
+    if [ "$PYTHON_PACKAGE_INSTALLER" = "uv" ]; then
+        "$PIP_PATH" install "uv==${UV_VERSION}" 2>/dev/null || true
+        PYTHON_INSTALL_CMD=("${PKG_DEST}/bin/uv" pip install --python "${PKG_DEST}/bin/python3")
+    fi
+
     # MarkItDown 0.1.x initializes Magika/ONNX at import time; the aarch64
     # onnxruntime wheel segfaults under NsJail. 0.0.2 still supports PPTX via
     # python-pptx without that native dependency.
-    if ! "$PIP_PATH" install \
+    if ! "${PYTHON_INSTALL_CMD[@]}" \
         openpyxl \
         matplotlib \
         numpy \
@@ -216,7 +288,15 @@ if [ -f "$PIP_PATH" ]; then
         fonttools \
         pytesseract \
         pdfminer \
-        vsdx; then
+        vsdx \
+        rasterio \
+        rioxarray \
+        geopandas \
+        pyogrio \
+        pyproj \
+        osmnx \
+        folium \
+        gpxpy; then
         echo "ERROR: Python package installation failed"
         INSTALL_FAILED=true
     else
@@ -277,16 +357,7 @@ if [ -n "$NODE_ARCH" ]; then
 }
 EOF
 
-            cat > "$NODE_DEST/run" << 'EOF'
-#!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODULE_DIR="${SCRIPT_DIR}/node_modules"
-if [ -d "$MODULE_DIR" ] && [ ! -e /mnt/data/node_modules ]; then
-    ln -s "$MODULE_DIR" /mnt/data/node_modules 2>/dev/null || true
-fi
-"${SCRIPT_DIR}/bin/node" "$@"
-EOF
-            chmod +x "$NODE_DEST/run"
+            write_node_launcher "$NODE_DEST"
 
             {
                 echo "PATH=${NODE_DEST}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:."
@@ -389,16 +460,7 @@ if [ -n "$BUN_ARCH" ]; then
 }
 EOF
 
-            cat > "$BUN_DEST/run" << 'EOF'
-#!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODULE_DIR="${SCRIPT_DIR}/node_modules"
-if [ -d "$MODULE_DIR" ] && [ ! -e /mnt/data/node_modules ]; then
-    ln -s "$MODULE_DIR" /mnt/data/node_modules 2>/dev/null || true
-fi
-"${SCRIPT_DIR}/bun" run "$@"
-EOF
-            chmod +x "$BUN_DEST/run"
+            write_bun_launcher "$BUN_DEST"
 
             {
                 echo "PATH=${BUN_DEST}:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:."

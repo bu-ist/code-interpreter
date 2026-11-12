@@ -2,7 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import type * as t from './types';
 import { planLimits } from './config';
-import { generateBashReplayPreamble, generateBashReplayPostamble } from './preamble-bash';
+import {
+    generateBashReplayPreamble,
+    generateBashReplayPostamble,
+} from './preamble-bash';
 import {
   PTC_HISTORY_FILENAME,
   PTC_HISTORY_SANDBOX_PATH,
@@ -11,10 +14,16 @@ import {
   buildScopedSentinel,
   isReservedPtcFilename,
 } from './ptc-constants';
-import { hashToolInput, pendingInputHashesFromRawPayload } from './tool-input-signature';
+import {
+    hashToolInput,
+    pendingInputHashesFromRawPayload,
+} from './tool-input-signature';
 
 // Load async matplotlib template for programmatic tool calling
-const templateCodeAsync = fs.readFileSync(path.join(__dirname, 'matplotlib-async.py'), 'utf8');
+const templateCodeAsync = fs.readFileSync(
+    path.join(__dirname, 'matplotlib-async.py'),
+    'utf8',
+);
 
 // =============================================================================
 // Programmatic Tool Calling Types & Preamble Generation
@@ -88,11 +97,41 @@ function normalizePythonFunctionName(name: string): string {
 
   // Python keywords to avoid
   const pythonKeywords = new Set([
-    'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
-    'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
-    'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is',
-    'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return',
-    'try', 'while', 'with', 'yield'
+        'False',
+        'None',
+        'True',
+        'and',
+        'as',
+        'assert',
+        'async',
+        'await',
+        'break',
+        'class',
+        'continue',
+        'def',
+        'del',
+        'elif',
+        'else',
+        'except',
+        'finally',
+        'for',
+        'from',
+        'global',
+        'if',
+        'import',
+        'in',
+        'is',
+        'lambda',
+        'nonlocal',
+        'not',
+        'or',
+        'pass',
+        'raise',
+        'return',
+        'try',
+        'while',
+        'with',
+        'yield',
   ]);
 
   if (pythonKeywords.has(normalized)) {
@@ -137,11 +176,14 @@ function jsonSchemaToPythonType(schema: JsonSchemaProperty): string {
  * Sort property names so required parameters come before optional ones.
  * Uses a Set for O(1) lookups instead of repeated array includes() calls.
  */
-function getSortedPropertyNames(propertyNames: string[], required: string[]): string[] {
+function getSortedPropertyNames(
+    propertyNames: string[],
+    required: string[],
+): string[] {
   const requiredSet = new Set(required);
   return [
     ...propertyNames.filter(name => requiredSet.has(name)),
-    ...propertyNames.filter(name => !requiredSet.has(name))
+        ...propertyNames.filter(name => !requiredSet.has(name)),
   ];
 }
 
@@ -155,7 +197,10 @@ function schemaToParams(schema?: JsonSchema): string {
 
   const required = schema.required ?? [];
   const requiredSet = new Set(required);
-  const sortedNames = getSortedPropertyNames(Object.keys(schema.properties), required);
+    const sortedNames = getSortedPropertyNames(
+        Object.keys(schema.properties),
+        required,
+    );
 
   const params: string[] = [];
 
@@ -192,7 +237,11 @@ function inferReturnType(description?: string): string {
 
   const desc = description.toLowerCase();
 
-  if (desc.includes('returns list') || desc.includes('returns array') || desc.includes('list of')) {
+    if (
+        desc.includes('returns list') ||
+        desc.includes('returns array') ||
+        desc.includes('list of')
+    ) {
     return 'List[Dict[str, Any]]';
   }
   if (desc.includes('returns dict') || desc.includes('returns object')) {
@@ -225,7 +274,10 @@ function generateDocstring(tool: LCTool): string {
     doc += '\n\n    Parameters:';
     const required = tool.parameters.required ?? [];
     const requiredSet = new Set(required);
-    const sortedNames = getSortedPropertyNames(Object.keys(tool.parameters.properties), required);
+        const sortedNames = getSortedPropertyNames(
+            Object.keys(tool.parameters.properties),
+            required,
+        );
 
     for (const name of sortedNames) {
       const propSchema = tool.parameters.properties[name];
@@ -253,7 +305,8 @@ function generateToolStub(tool: LCTool): string {
   const pythonFunctionName = normalizePythonFunctionName(tool.name);
 
   // If name was changed, add a comment
-  const nameComment = pythonFunctionName !== tool.name
+    const nameComment =
+        pythonFunctionName !== tool.name
     ? `    # Original tool name: ${tool.name}\n`
     : '';
 
@@ -271,7 +324,7 @@ ${nameComment}    _input = {${inputDict}}
  * Generates dual-mode stubs that work with or without await
  */
 export function generatePreamble(config: PreambleConfig): string {
-  const { callbackUrl, callbackToken, executionId, tools } = config;
+  const { callbackToken, executionId, tools } = config;
 
   // Header with HTTP callback infrastructure (dual-mode version)
   let preamble = `
@@ -284,73 +337,137 @@ import json
 import sys
 import os
 import asyncio
-import socket as _socket
-import http.client as _http_client
 from typing import Any, Dict, List, Optional, Union
-from urllib import request, error as urllib_error
 
-_CALLBACK_URL = "${callbackUrl}"
-_CALLBACK_TOKEN = "${callbackToken}"
-_EXECUTION_ID = "${executionId}"
+_CALLBACK_TOKEN = ${JSON.stringify(callbackToken)}
+_EXECUTION_ID = ${JSON.stringify(executionId)}
 _TOOL_CALL_COUNTER = 0
 _TOOL_CALL_LOCK = asyncio.Lock()
 
-# The proxy bind-mounts this fixed path into every sandbox; the env var
-# version was dropped to keep the path off os.environ introspection.
-_TOOL_CALL_SOCKET = "/tmp/tcs.sock"
+import stat as _stat
+import struct as _struct
+import threading as _threading
+import select as _select
+import time as _time
+from concurrent.futures import Future as _Future
 
-class _UnixHTTPConnection(_http_client.HTTPConnection):
-    """HTTPConnection that tunnels through a Unix domain socket"""
-    def __init__(self, socket_path):
-        super().__init__("localhost")
-        self._socket_path = socket_path
-    def connect(self):
-        self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self._socket_path)
+# These two anonymous pipe ends are granted only to an authorized invocation.
+_PIPE_WRITE_FD = 3
+_PIPE_READ_FD = 4
+_PIPE_MAX_FRAME = 1024 * 1024
+_PIPE_OWNER_PID = os.getpid()
+_PIPE_LOCK = _threading.Lock()
+_PIPE_WRITE_LOCK = _threading.Lock()
+_PIPE_PENDING = {}
+_PIPE_SEQUENCE = 0
+_PIPE_READER = None
+_PIPE_FAILURE = None
 
-def _unix_request(method, path, body=None, headers=None, timeout=300):
-    conn = _UnixHTTPConnection(_TOOL_CALL_SOCKET)
-    conn.timeout = timeout
-    conn.connect()
-    conn.request(method, path, body=body, headers=headers or {})
-    resp = conn.getresponse()
-    data = resp.read()
-    conn.close()
-    return resp.status, data
+# Spawned multiprocessing workers re-import this module without the granted
+# descriptors. They may import tool definitions, but cannot use the capability.
+if __name__ == "__mp_main__":
+    _PIPE_OWNER_PID = None
+else:
+    for _fd in (_PIPE_WRITE_FD, _PIPE_READ_FD):
+        try:
+            if not _stat.S_ISFIFO(os.fstat(_fd).st_mode):
+                raise OSError("tool-call descriptor is not an anonymous pipe")
+            os.set_inheritable(_fd, False)
+        except OSError as _error:
+            raise RuntimeError("blocking tool calls require a pipe-enabled runner") from _error
+    os.set_blocking(_PIPE_WRITE_FD, False)
 
-def _tcp_request(method, url, body=None, headers=None, timeout=300):
-    req = request.Request(url, data=body, headers=headers or {}, method=method)
-    with request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, resp.read()
+def _pipe_fail(error):
+    global _PIPE_FAILURE
+    with _PIPE_LOCK:
+        _PIPE_FAILURE = error
+        pending = list(_PIPE_PENDING.values())
+        _PIPE_PENDING.clear()
+    for future in pending:
+        if not future.done():
+            future.set_exception(error)
 
-def _probe_tool_call_socket():
-    # One-shot probe: is the path a live AF_UNIX listener? A real
-    # connect() succeeds against the proxy; a regular file or stale
-    # node returns ENOTSOCK / ECONNREFUSED. Done at preamble import
-    # time, *before* user code runs, so a malicious user cannot spoof
-    # /tmp/tcs.sock to flip the gate (a previous os.path.exists check
-    # was user-spoofable in legacy/no-proxy mode). Each NsJail
-    # invocation gets a fresh /tmp tmpfs so the probe result cannot
-    # bleed across jobs.
+def _pipe_read_exact(size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = os.read(_PIPE_READ_FD, remaining)
+        if not chunk:
+            raise EOFError("tool-call broker disconnected")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+def _pipe_read_responses():
     try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(_TOOL_CALL_SOCKET)
-        s.close()
-        return True
-    except OSError:
-        return False
-
-_USE_TOOL_CALL_SOCKET = _probe_tool_call_socket()
+        while True:
+            size = _struct.unpack("!I", _pipe_read_exact(4))[0]
+            if not 0 < size <= _PIPE_MAX_FRAME:
+                raise ValueError("invalid tool-call response size")
+            response = json.loads(_pipe_read_exact(size).decode("utf-8"))
+            if not isinstance(response, dict) or not isinstance(response.get("status"), int) or not isinstance(response.get("body"), str):
+                raise ValueError("invalid tool-call response")
+            with _PIPE_LOCK:
+                future = _PIPE_PENDING.pop(response.get("id"), None)
+            # A late response after a caller timeout has no pending waiter.
+            if future is not None:
+                future.set_result((response["status"], response["body"].encode("utf-8")))
+    except Exception as error:
+        _pipe_fail(error)
 
 def _do_request(method, path, body=None, headers=None, timeout=300):
-    # Cached at import time (see _probe_tool_call_socket). User code
-    # cannot influence this decision because it has not yet executed.
-    if _USE_TOOL_CALL_SOCKET:
-        return _unix_request(method, path, body, headers, timeout)
-    url = _CALLBACK_URL + path
-    return _tcp_request(method, url, body, headers, timeout)
+    global _PIPE_READER, _PIPE_SEQUENCE
+    if os.getpid() != _PIPE_OWNER_PID:
+        raise RuntimeError("tool calls must run in the invocation's primary process")
+    if method != "POST" or path != "/tool-call":
+        raise ValueError("unsupported tool-call route")
+    deadline = _time.monotonic() + timeout
+    future = _Future()
+    with _PIPE_LOCK:
+        if _PIPE_FAILURE is not None:
+            raise _PIPE_FAILURE
+        if len(_PIPE_PENDING) >= 16:
+            raise RuntimeError("too many concurrent tool calls")
+        if _PIPE_READER is None:
+            _PIPE_READER = _threading.Thread(target=_pipe_read_responses, daemon=True)
+            _PIPE_READER.start()
+        _PIPE_SEQUENCE += 1
+        sequence = _PIPE_SEQUENCE
+        _PIPE_PENDING[sequence] = future
+    try:
+        payload = json.dumps({
+            "id": sequence,
+            "headers": {key.lower(): value for key, value in (headers or {}).items()},
+            "body": (body or b"").decode("utf-8")
+        }).encode("utf-8")
+        if not 0 < len(payload) <= _PIPE_MAX_FRAME:
+            raise ValueError("tool-call request too large")
+        framed = _struct.pack("!I", len(payload)) + payload
+        # Serialize writes, but allow concurrent upstream requests and responses.
+        if not _PIPE_WRITE_LOCK.acquire(timeout=max(0, deadline - _time.monotonic())):
+            raise TimeoutError("tool-call write timeout")
+        try:
+            remaining = memoryview(framed)
+            while remaining:
+                wait = deadline - _time.monotonic()
+                if wait <= 0 or not _select.select([], [_PIPE_WRITE_FD], [], wait)[1]:
+                    raise TimeoutError("tool-call write timeout")
+                try:
+                    written = os.write(_PIPE_WRITE_FD, remaining[:4096])
+                except BlockingIOError:
+                    continue
+                remaining = remaining[written:]
+        except Exception as error:
+            # A partial frame cannot be reused for the next request.
+            _pipe_fail(error)
+            os.close(_PIPE_WRITE_FD)
+            raise
+        finally:
+            _PIPE_WRITE_LOCK.release()
+        return future.result(timeout=max(0, deadline - _time.monotonic()))
+    finally:
+        with _PIPE_LOCK:
+            _PIPE_PENDING.pop(sequence, None)
 
 class ToolExecutionError(Exception):
     """Raised when a tool call fails"""
@@ -447,11 +564,12 @@ async def _execute_tool_internal_async(tool_name: str, tool_input: Dict[str, Any
  * History is delivered as a file (not an env var) so very large histories
  * are not bounded by the Linux ARG_MAX / MAX_ARG_STRLEN ceiling.
  *
- * No socket bind mount, no Tool Call Server callback, no long-poll.
+ * No pipe capability, no Tool Call Server callback, no long-poll.
  */
 export function generateReplayPreamble(config: ReplayPreambleConfig): string {
   const { executionId, tools } = config;
-  const { start: scopedStart, end: scopedEnd } = buildScopedSentinel(executionId);
+    const { start: scopedStart, end: scopedEnd } =
+        buildScopedSentinel(executionId);
 
   let preamble = `
 # ============================================================================
@@ -465,7 +583,7 @@ import os
 import asyncio
 from typing import Any, Dict, List, Optional, Union
 
-_EXECUTION_ID = "${executionId}"
+_EXECUTION_ID = ${JSON.stringify(executionId)}
 _PTC_SENTINEL_START = "${scopedStart}"
 _PTC_SENTINEL_END = "${scopedEnd}"
 _PTC_HISTORY_PATH = os.environ.get("PTC_HISTORY_PATH") or "${PTC_HISTORY_SANDBOX_PATH}"
@@ -564,6 +682,63 @@ export interface ExtractPendingResult {
   }> | null;
 }
 
+export function extractPendingFromControlPayload(
+    rawPayload: string,
+): ExtractPendingResult['pending'] {
+    let parsed: { pending?: unknown } | null = null;
+    try {
+        parsed = JSON.parse(rawPayload) as { pending?: unknown };
+    } catch {
+        return null;
+    }
+
+    const pendingField = parsed?.pending;
+    if (!Array.isArray(pendingField)) return null;
+
+    const rawInputHashes = pendingInputHashesFromRawPayload(rawPayload);
+    type PendingWithIndex = {
+        c: { call_id: string; tool_name: string; input: unknown };
+        index: number;
+    };
+    const isPendingWithIndex = (entry: {
+        c: unknown;
+        index: number;
+    }): entry is PendingWithIndex => {
+        const { c } = entry;
+        return (
+            c != null &&
+            typeof c === 'object' &&
+            typeof (c as { call_id?: unknown }).call_id === 'string' &&
+            typeof (c as { tool_name?: unknown }).tool_name === 'string'
+        );
+    };
+    return pendingField
+        .map((c, index) => ({ c, index }))
+        .filter(isPendingWithIndex)
+        .map(({ c, index }) => {
+            const callSite = (c as { call_site?: unknown }).call_site;
+            const rawInputHash = rawInputHashes[index];
+            const hasObjectInput =
+                c.input != null && typeof c.input === 'object';
+            const input = (hasObjectInput ? c.input : {}) as Record<
+                string,
+                unknown
+            >;
+            return {
+                call_id: c.call_id,
+                tool_name: c.tool_name,
+                input,
+                input_hash:
+                    hasObjectInput && typeof rawInputHash === 'string'
+                        ? rawInputHash
+                        : hashToolInput(input),
+                ...(typeof callSite === 'string'
+                    ? { call_site: callSite }
+                    : {}),
+            };
+        });
+}
+
 /**
  * Locate the last line whose trimmed content exactly equals `marker`.
  * Using full-line anchoring prevents user-provided tool payloads that happen
@@ -581,7 +756,8 @@ function findSentinelLine(
   for (let i = lines.length - 1; i >= searchFromLine; i--) {
     if (lines[i].trim() === marker) {
       const startOffset = lineStartOffsets[i];
-      const endOffset = i + 1 < lineStartOffsets.length
+            const endOffset =
+                i + 1 < lineStartOffsets.length
         ? lineStartOffsets[i + 1] - 1
         : startOffset + lines[i].length;
       return { line: i, startOffset, endOffset };
@@ -619,48 +795,8 @@ export function extractPendingFromStdout(
 
   const payloadLines = lines.slice(startLine.line + 1, endLine.line);
   const rawPayload = payloadLines.join('\n').trim();
-  let parsed: { pending?: unknown } | null = null;
-  try {
-    parsed = JSON.parse(rawPayload) as { pending?: unknown };
-  } catch {
-    return { stdout, pending: null };
-  }
-
-  const pendingField = parsed?.pending;
-  if (!Array.isArray(pendingField)) return { stdout, pending: null };
-
-  const rawInputHashes = pendingInputHashesFromRawPayload(rawPayload);
-  type PendingWithIndex = {
-    c: { call_id: string; tool_name: string; input: unknown };
-    index: number;
-  };
-  const isPendingWithIndex = (entry: { c: unknown; index: number }): entry is PendingWithIndex => {
-    const { c } = entry;
-    return (
-      c != null &&
-      typeof c === 'object' &&
-      typeof (c as { call_id?: unknown }).call_id === 'string' &&
-      typeof (c as { tool_name?: unknown }).tool_name === 'string'
-    );
-  };
-  const pending = pendingField
-    .map((c, index) => ({ c, index }))
-    .filter(isPendingWithIndex)
-    .map(({ c, index }) => {
-      const callSite = (c as { call_site?: unknown }).call_site;
-      const rawInputHash = rawInputHashes[index];
-      const hasObjectInput = c.input != null && typeof c.input === 'object';
-      const input = (hasObjectInput ? c.input : {}) as Record<string, unknown>;
-      return {
-        call_id: c.call_id,
-        tool_name: c.tool_name,
-        input,
-        input_hash: hasObjectInput && typeof rawInputHash === 'string'
-          ? rawInputHash
-          : hashToolInput(input),
-        ...(typeof callSite === 'string' ? { call_site: callSite } : {}),
-      };
-    });
+    const pending = extractPendingFromControlPayload(rawPayload);
+    if (pending == null) return { stdout, pending: null };
 
   /** Strip only the sentinel block and leave every other byte of user
    * stdout untouched. Both the Python and bash preambles defensively
@@ -674,7 +810,10 @@ export function extractPendingFromStdout(
    * emission, and anything else that depends on byte-accurate stdout. */
   const rawHead = stdout.slice(0, startLine.startOffset);
   const head = rawHead.endsWith('\n') ? rawHead.slice(0, -1) : rawHead;
-  const tailStart = endLine.endOffset < stdout.length ? endLine.endOffset + 1 : stdout.length;
+    const tailStart =
+        endLine.endOffset < stdout.length
+            ? endLine.endOffset + 1
+            : stdout.length;
   const tail = stdout.slice(tailStart);
   const cleaned = head + tail;
 
@@ -688,11 +827,14 @@ export function extractPendingFromStdout(
 function wrapUserCodeInAsync(userCode: string): string {
   const lines = userCode.split('\n');
 
-  let wrapped = '# ============================================================================\n';
+    let wrapped =
+        '# ============================================================================\n';
   wrapped += '# USER CODE BEGINS BELOW\n';
-  wrapped += '# ============================================================================\n\n';
+    wrapped +=
+        '# ============================================================================\n\n';
   wrapped += 'async def __user_main__():\n';
-  wrapped += '    """Auto-generated wrapper for user code to support top-level await"""\n';
+    wrapped +=
+        '    """Auto-generated wrapper for user code to support top-level await"""\n';
 
   // Indent all user code
   for (const line of lines) {
@@ -743,10 +885,21 @@ const PROGRAMMATIC_RUN_TIMEOUT = 300000; // 5 minutes wall time
  * Create a payload for programmatic tool calling execution
  * Combines the tool preamble with user code
  */
-export function createProgrammaticPayload(options: CreateProgrammaticPayloadOptions): t.PayloadBody {
+export function createProgrammaticPayload(
+    options: CreateProgrammaticPayloadOptions,
+): t.PayloadBody {
   const {
-    req, session_id, execution_id, callbackUrl, callbackToken, tools, timeout,
-    mode = 'blocking', history, codeOverride, filesOverride,
+        req,
+        session_id,
+        execution_id,
+        callbackUrl,
+        callbackToken,
+        tools,
+        timeout,
+        mode = 'blocking',
+        history,
+        codeOverride,
+        filesOverride,
     language = 'python',
   } = options;
   const body = req.body as t.ProgrammaticRequestBody;
@@ -762,7 +915,14 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
       throw new Error('bash PTC is only supported in replay mode');
     }
     return buildBashPayload({
-      req, execution_id, session_id, tools, userCode, files, history, timeout,
+            req,
+            execution_id,
+            session_id,
+            tools,
+            userCode,
+            files,
+            history,
+            timeout,
     });
   }
 
@@ -771,7 +931,9 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     preamble = generateReplayPreamble({ executionId: execution_id, tools });
   } else {
     if (!callbackUrl || !callbackToken) {
-      throw new Error('blocking PTC mode requires callbackUrl and callbackToken');
+            throw new Error(
+                'blocking PTC mode requires callbackUrl and callbackToken',
+            );
     }
     preamble = generatePreamble({
       callbackUrl,
@@ -781,15 +943,21 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     });
   }
 
-  const isPyPlot = userCode.includes('import matplotlib') || userCode.includes('import seaborn');
+    const isPyPlot =
+        userCode.includes('import matplotlib') ||
+        userCode.includes('import seaborn');
 
   let finalCode: string;
 
   if (isPyPlot) {
-    const indentedUserCode = userCode.trim().split('\n').map(line => `    ${line}`).join('\n');
+        const indentedUserCode = userCode
+            .trim()
+            .split('\n')
+            .map(line => `    ${line}`)
+            .join('\n');
     const wrappedUserCode = templateCodeAsync.replace(
       /# BEGIN USER CODE\n[\s\S]*?# END USER CODE/,
-      `# BEGIN USER CODE\n${indentedUserCode}\n    # END USER CODE`
+            `# BEGIN USER CODE\n${indentedUserCode}\n    # END USER CODE`,
     );
     finalCode = preamble + '\n' + wrappedUserCode;
   } else {
@@ -797,7 +965,9 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     finalCode = preamble + wrappedUserCode;
   }
 
-  const run_memory_limit = planLimits[req.planId ?? '']?.run_memory_limit ?? planLimits.default.run_memory_limit;
+    const run_memory_limit =
+        planLimits[req.planId ?? '']?.run_memory_limit ??
+        planLimits.default.run_memory_limit;
   const run_timeout = timeout ?? PROGRAMMATIC_RUN_TIMEOUT;
 
   const payload: t.PayloadBody = {
@@ -809,8 +979,8 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     files: [
       {
         name: 'main.py',
-        content: finalCode
-      }
+                content: finalCode,
+            },
     ],
     session_id,
   };
@@ -851,13 +1021,27 @@ function buildBashPayload(args: {
   history?: Record<string, unknown>;
   timeout?: number;
 }): t.PayloadBody {
-  const { req, execution_id, session_id, tools, userCode, files, history, timeout } = args;
+    const {
+        req,
+        execution_id,
+        session_id,
+        tools,
+        userCode,
+        files,
+        history,
+        timeout,
+    } = args;
 
-  const preamble = generateBashReplayPreamble({ executionId: execution_id, tools });
+    const preamble = generateBashReplayPreamble({
+        executionId: execution_id,
+        tools,
+    });
   const postamble = generateBashReplayPostamble();
   const finalCode = preamble + userCode + '\n' + postamble;
 
-  const run_memory_limit = planLimits[req.planId ?? '']?.run_memory_limit ?? planLimits.default.run_memory_limit;
+    const run_memory_limit =
+        planLimits[req.planId ?? '']?.run_memory_limit ??
+        planLimits.default.run_memory_limit;
   const run_timeout = timeout ?? PROGRAMMATIC_RUN_TIMEOUT;
 
   const payload: t.PayloadBody = {
@@ -865,6 +1049,8 @@ function buildBashPayload(args: {
     run_timeout,
     language: 'bash',
     version: '5.2.0',
+        execution_id,
+        replay_tool_count: tools.length,
     files: [
       {
         name: 'main.sh',
