@@ -1,5 +1,66 @@
 import axios from 'axios';
 import type { AxiosError } from 'axios';
+import type { SandboxBackendErrorCode } from './sandbox-backend/types';
+
+// Keep the public response exhaustive too: a new terminal backend code must
+// not silently become an availability-related 503 after crossing BullMQ.
+const bridgePublicFailures: Partial<Record<string, { status: number; message: string }>> = {
+  BRIDGE_WORKER_UNAUTHORIZED: {
+    status: 403,
+    message: 'Code environment is not authorized for this tenant',
+  },
+  BRIDGE_WORKER_OFFLINE: {
+    status: 503,
+    message: 'Code environment is offline',
+  },
+  BRIDGE_WORKER_BUSY: {
+    status: 409,
+    message: 'Code environment is busy',
+  },
+  BRIDGE_EXECUTION_FAILED: {
+    status: 502,
+    message: 'Code environment execution failed',
+  },
+  BRIDGE_DEADLINE_EXCEEDED: {
+    status: 504,
+    message: 'Code environment execution timed out',
+  },
+  BRIDGE_ASSIGNMENT_FENCED: {
+    status: 409,
+    message: 'Code environment assignment is fenced; inspect the execution before retrying',
+  },
+  BRIDGE_ASSIGNMENT_NOT_FOUND: {
+    status: 409,
+    message: 'Code environment assignment is no longer available; inspect the execution before retrying',
+  },
+  BRIDGE_WORKER_FENCED: {
+    status: 409,
+    message: 'Code environment worker changed during execution; inspect the execution before retrying',
+  },
+  BRIDGE_WORKER_QUARANTINED: {
+    status: 409,
+    message: 'Code environment is quarantined; recover the worker before retrying',
+  },
+  BRIDGE_WORKSPACE_QUARANTINED: {
+    status: 409,
+    message: 'Code environment workspace is quarantined; reset the workspace before retrying',
+  },
+  BRIDGE_WORKER_MISMATCH: {
+    status: 409,
+    message: 'Code environment does not support this execution; select a compatible worker',
+  },
+  BRIDGE_ASSIGNMENT_INVALID: {
+    status: 400,
+    message: 'Code environment assignment is invalid',
+  },
+  BRIDGE_RESULT_INVALID: {
+    status: 502,
+    message: 'Code environment returned an invalid result',
+  },
+} satisfies Record<
+  Extract<SandboxBackendErrorCode, `BRIDGE_${string}`>,
+  { status: number; message: string }
+>;
 
 export function applySystemReplacements(input: string): string {
   return input;
@@ -108,6 +169,76 @@ export function sandboxErrorMessageFromAxios(error: AxiosError): string {
 
 export function publicExecutionFailure(error: unknown): { status: number; body: { error: string; message: string } } | null {
   const message = error instanceof Error ? error.message : '';
+
+  /* The worker normally publishes a typed deadline failure before this wait
+   * expires. If cleanup itself consumes the bounded completion grace, BullMQ
+   * supplies its own timeout string; keep both internal shapes sanitized and
+  * caller-correct rather than falling through to a generic 500. */
+  const workerDeadlineExpired = /^Job timed out after \d+ms$/.test(message);
+  const bullmqWaitExpired =
+    /^Job wait .+ timed out before finishing, no finish notification arrived after \d+ms \(id=.+\)$/
+      .test(message);
+  if (workerDeadlineExpired || bullmqWaitExpired) {
+    return {
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    };
+  }
+
+  /* Typed worker failures cross BullMQ as `<CODE>: <message>`. Runtime-session
+   * MicroVM, and bridge codes describe sandbox availability; SESSION_INPUT_* codes
+   * describe the caller's declared input set or its upstream object source. */
+  const backendMatch = message.match(
+    /^(RUNTIME_SESSION_BUSY|MICROVM_[A-Z_]+|BRIDGE_[A-Z_]+|SESSION_INPUT_[A-Z_]+):/,
+  );
+  if (backendMatch) {
+    const code = backendMatch[1];
+    const bridgeFailure = bridgePublicFailures[code];
+    if (bridgeFailure != null) {
+      return {
+        status: bridgeFailure.status,
+        body: { error: code.toLowerCase(), message: bridgeFailure.message },
+      };
+    }
+    const statuses: Record<string, number> = {
+      RUNTIME_SESSION_BUSY: 409,
+      SESSION_INPUT_TOO_LARGE: 413,
+      SESSION_INPUT_UNAVAILABLE: 422,
+      SESSION_INPUT_SOURCE_FAILED: 502,
+      SESSION_INPUT_PREPARATION_FAILED: 500,
+      SESSION_INPUT_ABORTED: 504,
+    };
+    const sessionInputFailure = code.startsWith('SESSION_INPUT_');
+    const status = statuses[code] ?? (sessionInputFailure ? 500 : 503);
+    const publicMessages: Record<string, string> = {
+      RUNTIME_SESSION_BUSY: 'Runtime session is busy',
+      MICROVM_LAUNCH_FAILED: 'Sandbox launch failed',
+      MICROVM_LAUNCH_THROTTLED: 'Sandbox capacity is temporarily unavailable',
+      MICROVM_UNHEALTHY: 'Sandbox runtime is unavailable',
+      MICROVM_FENCED: 'Runtime session changed during execution',
+      MICROVM_DEADLINE_EXCEEDED: 'Sandbox execution deadline exceeded',
+      SESSION_INPUT_TOO_LARGE: 'Input files exceed the delivery limit',
+      SESSION_INPUT_UNAVAILABLE: 'One or more input files are unavailable',
+      SESSION_INPUT_SOURCE_FAILED: 'Input file service is unavailable',
+      SESSION_INPUT_PREPARATION_FAILED: 'Input files could not be prepared',
+      SESSION_INPUT_ABORTED: 'Input delivery timed out',
+    };
+    /* The backend message is retained in worker/router logs, but it can contain
+     * AWS identifiers, internal endpoints, object ids, or file names. Only the
+     * stable code and a fixed public message cross the API boundary. */
+    return {
+      status,
+      body: {
+        error: code.toLowerCase(),
+        message: publicMessages[code]
+          ?? (sessionInputFailure ? 'Input delivery failed' : 'Sandbox runtime is unavailable'),
+      },
+    };
+  }
+
   const match = message.match(/^Error from sandbox(?:\s+\[([a-z_]+)\])?:\s*(?:\[([a-z_]+)\]\s*)?(.+)$/);
   if (!match) return null;
 

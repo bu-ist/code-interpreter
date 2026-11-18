@@ -1,5 +1,6 @@
 data/
 node_modules
+packages/*/dist/
 .env
 .git
 .npmrc
@@ -7,10 +8,12 @@ node_modules
 /file-server-logs/**/*
 /service-logs/**/*
 /tool-call-server-logs/**/*
+/.build-lambda-microvm/
 
 # Helm artifacts
 helm/*/charts/*.tgz
 helm/*/Chart.lock
+/dist/
 
 # Local sandbox runtime data (docker volume mount)
 data/

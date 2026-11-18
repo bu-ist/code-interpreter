@@ -19,6 +19,30 @@ Split runtime deployments:
 {{- if not .Values.executionManifest.publicKey }}
 {{- fail "workerSandbox.enabled requires executionManifest.publicKey so sandbox-runner can verify signed execute manifests without a signing secret. The chart ships no default keypair; derive the public key from your Ed25519 private key (see helm/codeapi/README.md 'Execution manifest signing keys') and set it via --set or a values file (base64 DER or PEM with escaped newlines). For minikube local dev use -f values-local.yaml" }}
 {{- end }}
+{{- $packagesSource := .Values.workerSandbox.packages.source | default "image" }}
+{{- if and (ne $packagesSource "image") (ne $packagesSource "pvc") }}
+{{- fail "workerSandbox.packages.source must be image or pvc" }}
+{{- end }}
+{{- $packagesFromPvc := eq $packagesSource "pvc" }}
+{{- if and (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
+{{- fail "workerSandbox.packages.source=image requires workerSandbox.kvmEnabled=true because the baked runner boots from a libkrun block root image" }}
+{{- end }}
+{{- $clockSkewLimitValue := toString .Values.workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds }}
+{{- $clockSkewJitterValue := toString .Values.workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds }}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $clockSkewLimitValue) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be a non-negative integer" }}
+{{- end }}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $clockSkewJitterValue) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be a non-negative integer" }}
+{{- end }}
+{{- $clockSkewLimit := int $clockSkewLimitValue }}
+{{- $clockSkewJitter := int $clockSkewJitterValue }}
+{{- if or (lt $clockSkewLimit 0) (ge $clockSkewLimit 25) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be between 0 and 24 so the 5-second healthcheck timeout stays below the 30-second execution-manifest tolerance" }}
+{{- end }}
+{{- if or (lt $clockSkewJitter 0) (and (gt $clockSkewLimit 0) (ge $clockSkewJitter $clockSkewLimit)) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds when the clock-skew guard is enabled" }}
+{{- end }}
 {{- range .Values.workerSandbox.sandboxExtraEnv }}
 {{- $name := .name | default "" }}
 {{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
@@ -123,6 +147,10 @@ spec:
 {{ include "codeapi.otel.env" (dict "root" . "serviceName" "aiml-codeapi-service-worker") | nindent 12 }}
             - name: CODEAPI_HARDENED_SANDBOX_MODE
               value: {{ .Values.hardenedSandboxMode | quote }}
+            {{- with .Values.executionProfile }}
+            - name: CODEAPI_EXECUTION_PROFILE
+              value: {{ . | quote }}
+            {{- end }}
             - name: SANDBOX_ENDPOINT
               value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
             - name: EGRESS_GATEWAY_URL
@@ -249,7 +277,11 @@ spec:
             - name: LAUNCHER_FILTER_VSOCK_ENOTCONN
               value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
             - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
-              value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | default 40000 | quote }}
+              value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS
+              value: {{ $clockSkewLimit | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS
+              value: {{ $clockSkewJitter | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL
@@ -282,6 +314,14 @@ spec:
               value: {{ (.Values.workerSandbox.sandbox.jobUidCount | default (.Values.workerSandbox.sandbox.maxConcurrentJobs | default (mul (.Values.workerSandbox.launcher.vcpus | default 2) 4))) | quote }}
             - name: SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS
               value: {{ (.Values.workerSandbox.sandbox.workspaceReaperMaxAgeSeconds | default 3600) | quote }}
+            - name: SANDBOX_HTTP_INPUT_CACHE_ENABLED
+              value: {{ .Values.workerSandbox.sandbox.httpInputCacheEnabled | quote }}
+            - name: SANDBOX_HTTP_INPUT_CACHE_MAX_INFLIGHT
+              value: {{ .Values.workerSandbox.sandbox.httpInputCacheMaxInflight | quote }}
+            - name: SANDBOX_HTTP_INPUT_CACHE_MAX_OBJECTS
+              value: {{ .Values.workerSandbox.sandbox.httpInputCacheMaxObjects | quote }}
+            - name: SANDBOX_INPUT_CACHE_MAX_BYTES
+              value: {{ .Values.workerSandbox.sandbox.inputCacheMaxBytes | quote }}
             - name: SANDBOX_EXECUTE_BODY_LIMIT
               value: {{ .Values.workerSandbox.sandbox.executeBodyLimit | quote }}
             - name: SANDBOX_DISABLE_NETWORKING
@@ -297,14 +337,18 @@ spec:
             {{- with .Values.workerSandbox.sandboxExtraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if or $packagesFromPvc $useKvmHostPath }}
           volumeMounts:
+            {{- if $packagesFromPvc }}
             - name: packages
               mountPath: /host-packages
               readOnly: true
+            {{- end }}
             {{- if $useKvmHostPath }}
             - name: dev-kvm
               mountPath: /dev/kvm
             {{- end }}
+          {{- end }}
           {{- if .Values.workerSandbox.kvmEnabled }}
           securityContext:
             privileged: false
@@ -350,14 +394,15 @@ spec:
                 - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 60
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 7
           readinessProbe:
-            httpGet:
-              path: /api/v2/health
-              port: sandbox
+            exec:
+              command:
+                - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 7
+            failureThreshold: 1
           resources:
             {{- $sandboxResources := deepCopy .Values.workerSandbox.resources }}
             {{- if $useKvmDevicePlugin }}
@@ -369,7 +414,9 @@ spec:
             {{- $_ := set $sandboxResources "limits" $limits }}
             {{- end }}
             {{- toYaml $sandboxResources | nindent 12 }}
+      {{- if or $packagesFromPvc $useKvmHostPath }}
       volumes:
+        {{- if $packagesFromPvc }}
         - name: packages
           {{- if .Values.workerSandbox.packages.hostPath }}
           hostPath:
@@ -384,12 +431,14 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
         {{- if $useKvmHostPath }}
         - name: dev-kvm
           hostPath:
             path: /dev/kvm
             type: CharDevice
         {{- end }}
+      {{- end }}
       {{- with $sandboxRunnerNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

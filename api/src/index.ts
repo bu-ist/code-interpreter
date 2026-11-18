@@ -6,7 +6,11 @@ import { validateHardenedSandboxStartup } from './secure-startup';
 import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './workspace-isolation';
 import { httpMetricsMiddleware, metricsHandler } from './metrics';
 import { positiveInt, shutdownTelemetry, traceHttpRequest } from './telemetry';
+import { startWarmupCommand } from './warmup';
+import { stopToolCallSocketProxy } from './tool-call-socket-process';
+import { hostedAppSupervisor, validateHostedAppStartup } from './hosted-app';
 import v2Router from './api/v2';
+import lifecycleRouter, { LIFECYCLE_HOOK_BASE_PATH } from './api/lifecycle';
 
 const app = express();
 
@@ -29,6 +33,7 @@ loadPackages(config.packages_directory);
 
 logger.info('Registering routes');
 app.get('/metrics', metricsHandler);
+app.use(LIFECYCLE_HOOK_BASE_PATH, lifecycleRouter);
 app.use('/api/v2', v2Router);
 
 app.get('/', (_req, res) => {
@@ -62,15 +67,16 @@ app.use((err: HttpError, _req: express.Request, res: express.Response, _next: ex
 });
 
 async function main(): Promise<void> {
+  validateHostedAppStartup();
   validateHardenedSandboxStartup();
   await initializeSandboxWorkspaceIsolation();
+  await startWarmupCommand();
 
   const [address, port] = config.bind_address.split(':');
   const stopWorkspaceReaper = startWorkspaceReaper();
   const server = app.listen(Number(port), address, () => {
     logger.info({ address: config.bind_address }, 'Sandbox API started');
   });
-
   let shuttingDown = false;
   const closeHttpServer = (): Promise<void> => new Promise((resolve, reject) => {
     server.close((error) => {
@@ -107,6 +113,12 @@ async function main(): Promise<void> {
     shuttingDown = true;
     stopWorkspaceReaper();
     await closeHttpServerWithTimeout();
+    await hostedAppSupervisor.shutdown().catch((err) => {
+      logger.warn({ err }, 'Hosted-app process shutdown failed');
+    });
+    await stopToolCallSocketProxy().catch((err) => {
+      logger.warn({ err }, 'Tool-call socket proxy shutdown failed');
+    });
     try {
       await shutdownTelemetry();
     } catch (err) {

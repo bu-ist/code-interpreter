@@ -1,0 +1,383 @@
+# Remote Code Bridge
+
+Remote Code Bridge makes an operator-owned VM a stateful Code API execution
+environment without exposing that VM to inbound internet traffic.
+
+For an end-to-end host setup, including pairing, named environments, systemd,
+launchd, GitHub App credentials, upgrades, verification, and recovery, see the
+[self-hosted worker runbook](./worker-runbook.md).
+
+```text
+LibreChat -> Code API -> Redis assignment
+                         ^             |
+                         | outbound    v
+                    @librechat/code -> local sandbox
+```
+
+Code API remains the public authentication, policy, manifest, timeout, and
+result-normalization boundary. The bridge worker has a separate operator
+identity and never accepts end-user bearer tokens directly.
+
+## Code API configuration
+
+Run this as an isolated stateful Code API deployment:
+
+```dotenv
+CODEAPI_SANDBOX_BACKEND=remote-bridge
+CODEAPI_EXECUTION_PROFILE=stateful
+CODEAPI_RUNTIME_SESSION_MODE=affinity
+CODEAPI_BRIDGE_WORKER_ID=my-vm
+CODEAPI_BRIDGE_TOKEN=<strong-administrator-bootstrap-secret>
+CODEAPI_BRIDGE_AUTH_MODE=paired
+```
+
+To opt in to durable machine authorization on every Code API replica, set a
+single stable public **Code API** origin (not the LibreChat URL):
+
+```dotenv
+CODEAPI_BRIDGE_RECOVERY_SERVER_ID=https://code.example.com
+# 0 (default): enrolled machine keys remain authorized until revoked.
+# CODEAPI_BRIDGE_ENROLLMENT_TTL_SECONDS=0
+# CODEAPI_BRIDGE_RECOVERY_CHALLENGE_TTL_SECONDS=60
+# CODEAPI_BRIDGE_RECOVERY_MAX_CHALLENGES_PER_MINUTE=12
+# CODEAPI_BRIDGE_RECOVERY_MAX_ATTEMPTS_PER_MINUTE=30
+# CODEAPI_BRIDGE_RECOVERY_MAX_UNTRUSTED_PER_MINUTE=240
+```
+
+Omitting the server ID retains the existing pairing and refresh behavior and
+hides the recovery routes. Deploy the compatible Code API version to **all**
+replicas before setting this value and enrolling workers again. Older Code API
+replicas can still pair or refresh a worker but do not write durable enrollment;
+they must not serve device login or recovery requests. Only a pairing redeemed
+after this option is enabled has a recoverable key. Updating Code API alone
+does not make old workers reconnect automatically: the CLI must also implement
+this recovery protocol in the later worker release.
+
+Store Redis state durably across restarts. The primary `docker-compose.yaml`
+now uses Redis AOF and a named `/data` volume; preserve that volume when
+recreating the stack. If upgrading a running stack with an in-memory Redis,
+migrate its state before recreating the container: mounting an empty volume
+does **not** preserve active assignments, fences, or earlier revocations. Other
+deployments must provide equivalent durable Redis (for example, a managed
+persistent Redis service and backups). Revocation and
+machine enrollment share that state across replicas; do not configure eviction
+of authorization keys. If enrollment state is missing, credentials minted under
+that enrollment fail closed, and the worker must be explicitly enrolled again.
+Restoring a backup from *before* a revocation can revive trust; reconcile
+revocations after recovery from backup. Use a distinct server ID for each Code
+API deployment and keep it stable when the endpoint changes behind a proxy.
+
+Use `strict` instead of `affinity` if every request must include a runtime
+session hint. In hardened mode, startup requires the bridge token to be at least
+32 bytes. `PTC_MODE=blocking` is rejected; replay mode is required because a
+remote execution cannot retain an open Code API process across tool callbacks.
+
+To attach multiple principal-owned workers to one Code API deployment, enable
+dynamic routing. A compatibility default worker is optional in this mode:
+
+```dotenv
+CODEAPI_BRIDGE_DYNAMIC_WORKERS=true
+CODEAPI_BRIDGE_AUTH_MODE=paired
+# CODEAPI_BRIDGE_WORKER_ID=my-default-vm
+```
+
+Dynamic routing is accepted only with paired authentication. LibreChat signs
+the selected worker into the short-lived Code API JWT as `code_worker_id`.
+`X-LibreChat-Code-Worker-ID` remains the transport header, but Code API accepts
+it only when it exactly matches that authenticated claim. The resolved worker
+is persisted across the queue and programmatic replay boundaries, and Code API
+requires both its stored tenant binding and registered worker credential before
+creating a lease.
+
+Create a single-use pairing code with the administrator secret:
+
+```bash
+curl -fsS https://code.example.com/v1/bridge/pairings \
+  -H "Authorization: Bearer $CODEAPI_BRIDGE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"workerId":"my-vm"}'
+```
+
+With dynamic routing enabled, the trusted control plane must bind each pairing
+to one tenant and generic principal. Code API treats the principal as lifecycle
+and audit metadata; LibreChat remains responsible for resolving user, role, and
+group membership before selecting the worker:
+
+```bash
+curl -fsS https://code.example.com/v1/bridge/pairings \
+  -H "Authorization: Bearer $CODEAPI_BRIDGE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "workerId":"user-vm",
+    "binding":{
+      "tenantId":"tenant-1",
+      "principal":{"type":"user","id":"user-1"}
+    }
+  }'
+```
+
+Principal types are `deployment`, `tenant`, `user`, `role`, and `group`.
+Pairing and registration bodies from the VM cannot replace the server-issued
+binding, and credential rotation preserves it.
+
+Redeem the returned code on the VM using
+[`@librechat/code`](../../packages/code/README.md). The CLI generates its key
+locally, proves possession on every request, and rotates its short-lived
+credential before expiry. `CODEAPI_BRIDGE_AUTH_MODE=static` remains available
+for non-hardened development compatibility only.
+
+To expose an existing checkout as a worker-local workspace, start the CLI with
+an explicit directory and logical ID:
+
+```bash
+librechat-code run \
+  --worker-dir /srv/checkouts/librechat \
+  --workspace-id primary \
+  --workspace-name LibreChat
+```
+
+The worker advertises only the workspace ID, optional display name, and
+supported operations. Its host path is never registered with Code API. An
+authenticated caller can execute the initial read-only operations through:
+
+```bash
+curl -fsS https://code.example.com/v1/workspace-tools/execute \
+  -H "Authorization: Bearer $LIBRECHAT_JWT" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "protocolVersion":1,
+    "operation":"read_file",
+    "workspaceId":"primary",
+    "path":"README.md",
+    "startLine":1,
+    "maxLines":200
+  }'
+```
+
+The endpoint uses the same authenticated principal-bound worker selection,
+tenant fence, lease deadline, cancellation, and settlement lifecycle as remote
+sandbox execution. Requests must name a workspace and operation advertised by
+that worker. Results are validated against the originating request before they
+leave Code API, and are bounded to 1 MiB/500 lines for reads, 200 matches for
+searches, or 500 relative paths for file listings. Absolute paths, traversal,
+backslashes, symlink escapes, unexpected fields, and host roots are rejected.
+
+Workspace mutation remains disabled unless the operator starts the worker with
+`--allow-workspace-writes` (or
+`LIBRECHAT_CODE_ALLOW_WORKSPACE_WRITES=true`). That adds bounded `write_file`
+and exact-match `edit_file` operations. Writes are limited to 1 MiB of UTF-8
+text, require an existing in-workspace parent directory, reject symlinks, and
+commit atomically. The worker capability is an enforcement boundary; LibreChat
+should still route every mutation through its configurable tool-approval hooks.
+
+The workspace root can be an existing project, a Git repository, or an empty
+directory; Git is not required. This boundary keeps that directory local to the
+operator's machine, but selected file contents, search matches, relative file
+listings, and later tool results necessarily cross the outbound bridge to Code
+API and the model.
+Treat them as explicit tool outputs, apply the same retention and audit policy
+as chat content, and do not register a directory containing secrets. The
+default operations are read-only. Operators can explicitly add bounded
+`execute_command` support with `--allow-workspace-commands` (or
+`LIBRECHAT_CODE_ALLOW_WORKSPACE_COMMANDS=true`). The CLI prepares its sandbox
+before registration, so Code API cannot dispatch commands to an unavailable
+boundary. LibreChat's tool-approval hooks remain the per-call decision point.
+
+The package exposes `SandboxWorkspaceTools` for composing that boundary without
+ever invoking an unsandboxed host shell. It requires an explicit sandbox
+implementation and an allowlist of workspace IDs, preserves per-workspace
+operation restrictions, validates bounded results, and treats an unknown
+command failure as an uncertain mutation.
+
+Selected attached workspaces on macOS, Linux, and WSL2 can also advertise Bash
+Programmatic Tool Calling. Native Windows workers do not advertise Bash PTC.
+Code API then runs each replay iteration through the same workspace-scoped
+native SRT executor. Source code operates in the selected local root, while
+replay metadata, injected skills and attachments, and generated artifacts are
+staged in an execution-private data directory and removed after settlement.
+Only authorized file references and returned artifacts cross the relay; the
+repository is never uploaded to Code API. This capability is advertised only
+when native SRT commands and a file-relay upstream are both configured, so
+older or partially configured workers continue to fail closed.
+
+Native SRT is the MVP and default command backend on a user's chosen laptop or
+VM. It uses Seatbelt on macOS, bubblewrap/seccomp on Linux, and the SRT
+restricted-account helper on Windows. It confines writes to the registered
+workspace, denies reads of the worker home and control files, strips worker
+credentials, and denies network egress by default. Startup fails closed when
+the platform dependencies are unavailable; there is no unsandboxed fallback.
+Use `LIBRECHAT_CODE_COMMAND_ALLOWED_DOMAINS` for an explicit comma-separated
+egress allowlist.
+Linux hosts must provide `bubblewrap`, `socat`, and `ripgrep`; macOS uses
+system facilities. Bash Programmatic Tool Calling additionally requires Bash
+5.2 or newer and `jq` on `PATH` on macOS, Linux, and WSL2. The worker resolves
+the compatible shell from `PATH` rather than assuming `/bin/bash`. Windows
+requires SRT's one-time restricted-account setup.
+
+The optional `docker-nsjail` adapter enables a stronger container boundary with
+`--allow-workspace-commands` (or
+`LIBRECHAT_CODE_ALLOW_WORKSPACE_COMMANDS=true`) and a registered worker/default
+directory. It mounts only the canonical workspace, keeps the runner port
+unpublished, authenticates its dedicated command route with an ephemeral
+container capability, and runs Bash inside the existing NsJail profile. Direct
+endpoint mode cannot be used as the `runtime` command backend, but endpoint
+runtime supervision can coexist with native SRT commands. Set
+`LIBRECHAT_CODE_COMMAND_SANDBOX=runtime` to select Docker/NsJail explicitly.
+This deployment permission does not replace the per-call approval decision:
+LibreChat must apply its configurable tool-approval hooks before dispatching
+`execute_command`.
+
+Stateful deployments must also set `LIBRECHAT_CODE_STATEFUL_WORKSPACE=true`
+and route the CLI's `{runtimeSessionId}` endpoint template to an isolated,
+persistent local runner per session. A single sandbox endpoint is stateless and
+is rejected for runtime-session assignments.
+
+## LibreChat configuration
+
+Expose the Code API deployment as an environment under the Agents endpoint:
+
+```yaml
+endpoints:
+    agents:
+        statefulCodeSessions:
+            allowedEnvironments: [user, agent-user, conversation]
+            environments:
+                - id: my-vm
+                  name: My VM
+                  type: attached
+                  baseURL: https://code.example.com/v1
+                  default: true
+```
+
+Agents may select this environment with `code_environment_id: my-vm`.
+LibreChat derives a stable per-conversation runtime session ID, so commands in
+later turns reuse the same workspace. Attached environments deliberately skip
+background prewarming: the single worker lease is reserved for explicit user
+execution.
+
+## Lifecycle and fencing
+
+- Registration is ephemeral in Redis and must be refreshed by the worker.
+- Pairing codes are stored hashed, expire after ten minutes, and are consumed
+  atomically on their first redemption attempt.
+- Worker credentials expire after fifteen minutes and are bound to an Ed25519
+  public key. Exact-request signatures include the HTTP method, path, body
+  digest, timestamp, nonce, and credential. With recovery enabled, redeeming a
+  pairing also persists a separate machine authorization and its public key in
+  Redis without a TTL by default; an operator can instead set a bounded
+  enrollment lifetime.
+- `POST /v1/bridge/workers/:workerId/credentials/challenge` does not require
+  an administrator token or an existing access credential, but **does** require
+  the enrolled key. Its JSON body contains `protocolVersion: 1`,
+  `operation: "credential.challenge"`, the configured `serverId`, the matching
+  `workerId`, a fresh UTC ISO `timestamp`, a random 32-byte base64url `nonce`,
+  and `signature` computed with `signBridgeRecoveryStart(privateKey, fields)`
+  from `@librechat/code/identity`. Code API verifies the signed fields and
+  consumes the nonce once before charging the machine's shared challenge
+  budget; a fabricated request cannot exhaust another worker's budget.
+- The response is a short-lived, single-use challenge with the server ID,
+  worker ID, enrollment generation, operation and expiry. Sign those fields
+  with `signBridgeRecovery(privateKey, challenge)` and send the fields plus
+  `signature` to `POST .../credentials/recover` to obtain a new short-lived
+  credential. Invalid proofs are limited per high-entropy challenge; only
+  successfully verified, unused proofs consume the machine's shared recovery
+  budget. Separately, both recovery endpoints limit all incoming requests per
+  connection peer *before* key verification, including well-formed JSON with
+  malformed or forged proofs; forged headers and worker IDs cannot bypass
+  that limit or consume the signed machine budget. All limits live in shared
+  Redis; HTTP 429 means back off. When a reverse proxy connects to Code API,
+  its clients share that peer's limit. Restrict direct backend access and apply
+  client-IP and global
+  abuse limits at the trusted ingress to keep one proxy peer from becoming a
+  shared bottleneck; do not trust an arbitrary `X-Forwarded-For` on Code API.
+- Recovery and revocation are atomic Redis transitions across API replicas.
+  A missing, revoked, expired or superseded enrollment never creates new
+  credentials. Recovery only restores transport authentication. It does not
+  clear assignment fences, worker or workspace quarantine, or uncertain
+  execution state. The worker private key is a durable, revocable credential;
+  expiry of an access credential alone does **not** protect against key theft.
+- Accepted proof nonces cannot be replayed, credentials rotate before expiry,
+  and an administrator can revoke the active worker identity immediately.
+- Assignment leases bind to a stable paired identity rather than an individual
+  short-lived credential. Rotation preserves that identity; pairing again
+  replaces it and fences work queued for the previous owner.
+- Remote bridge deployments use backend-specific BullMQ queues and serialize
+  the expected backend on every new job, preventing Lambda or HTTP consumers
+  from accepting attached-worker executions.
+- Code API negotiates a bounded number of active workspace assignments per
+  worker. The lower API or worker slot ceiling wins, and assignments sharing
+  the same workspace isolation key remain serialized while independent
+  conversation worktrees may run concurrently. A linked-worktree lane
+  (`worktree: <name>`) nests beneath its checkout's key: sibling lanes run
+  concurrently, while a lane and its checkout exclude each other, and a lane
+  cannot start while its checkout is quarantined.
+- Workspace tool admission waits for capacity up to 30 seconds without a
+  `X-LibreChat-Workspace-Queue-Wait-Ms` header. A caller can advertise a longer
+  per-request allowance, bounded by five minutes and any server queue ceiling.
+  Disconnects cancel waiting, and admitted work receives a separate execution
+  budget capped by `JOB_TIMEOUT`. A shorter client or proxy timeout can end the
+  wait sooner; Code API does not receive an absolute caller deadline. See
+  [BYOM worker admission](../byom-worker-admission.md) for the total-request
+  and proxy timeout requirements.
+- Dynamic workers are fenced to their server-issued tenant before assignment.
+- Each assignment has an absolute deadline, generation, and random lease token.
+- Settlements with the wrong worker, generation, token, or expired deadline are
+  rejected.
+- Assignments are queued for the exact registered worker incarnation, so an
+  outstanding poll from a replaced process cannot consume replacement work.
+- Assignment records and the worker lock live through the full configured job
+  deadline plus cleanup grace.
+- Ambiguous settlement delivery is retried through the assignment deadline. If
+  a stateful settlement remains ambiguous, the CLI exits and the affected local
+  session runner must be reset or discarded before restart.
+- Enqueueing stateful work atomically creates a durable in-flight workspace
+  marker. A definite rejection or successful result finalization clears it;
+  worker or VM loss leaves it in place so later reuse fails closed. Settlement
+  receipts outlive assignment cleanup briefly so retries are idempotent and
+  cannot recreate a cleared marker.
+- To recover a fenced session, stop the normal worker process and discard/reset
+  that session's local sandbox workspace. While it remains stopped, run
+  `librechat-code reset-workspace <runtime-session-id>` with the same worker
+  configuration; the command temporarily registers its own incarnation and
+  exits. Start the normal worker only after the reset command succeeds. Code API
+  refuses the acknowledgement while work is active or when it is not made by
+  the currently registered incarnation.
+- Request cancellation is polled by the worker and aborts the local sandbox
+  request.
+- Replay PTC clients may attach a fresh `X-LibreChat-Code-Request-ID` to each
+  `/exec/programmatic` request and send that same opaque ID to
+  `POST /v1/exec/programmatic/cancel`. Code API binds the short-lived request
+  record to the authenticated principal, durably marks cancellation in Redis,
+  and publishes it to the worker process holding the BullMQ job. This explicit
+  path avoids relying on HTTP connection teardown, frees waiting jobs
+  immediately, and interrupts active remote-bridge assignments without polling
+  once per active job.
+  Cancellation and completed-result publication use an atomic Redis decision:
+  a late cancel returns `already_completed` instead of acknowledging Stop after
+  completion won. Ambiguous enqueue/cancellation errors retain replay ownership
+  until a durable fence or the original job deadline. Completed results are
+  retained temporarily (bounded to 16 MiB) so a lost BullMQ completion reply
+  does not cause sandbox effects to be repeated. Reconnect reconciliation reads
+  only small status markers, using one subscriber per process.
+  Roll out the matching Code API queue-worker processes before enabling this
+  endpoint on API replicas; pre-cancellation workers do not observe its markers.
+- A leased assignment remains in a Redis-backed delivery claim until the worker
+  explicitly acknowledges it; reconnecting before acknowledgement redelivers
+  the same fenced assignment instead of losing it after an HTTP disconnect.
+- The sandbox receives the stable runtime session ID separately from the lease;
+  workspace state belongs to that session, not to a transient assignment.
+
+## Security boundaries
+
+The bridge removes inbound VM exposure; it does not replace sandbox isolation.
+For internet-facing LibreChat deployments, use the hardened microVM/NsJail
+stack, default-deny sandbox egress, signed execution manifests, least-privilege
+host credentials, resource limits, and host/network monitoring. Bind the local
+sandbox endpoint to loopback or a private container network. Rotate a leaked
+administrator token immediately. Pairing secures worker transport identity; it
+cannot attest that a compromised VM truthfully reports or enforces its sandbox
+capabilities.
+
+LibreChat's owner-scoped environment registry can issue these principal-bound
+pairings without changing the worker execution protocol or moving code tools
+into the Agents SDK.

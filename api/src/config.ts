@@ -53,7 +53,7 @@ export const config = {
   disable_networking: (process.env.SANDBOX_DISABLE_NETWORKING ?? 'true') === 'true',
   use_cgroupv2: (process.env.SANDBOX_USE_CGROUPV2 ?? 'true') === 'true',
   allowed_local_network_port: Number(process.env.SANDBOX_ALLOWED_LOCAL_NETWORK_PORT ?? 0),
-  output_max_size: Number(process.env.SANDBOX_OUTPUT_MAX_SIZE ?? 1024),
+  output_max_size: safeInt(process.env.SANDBOX_OUTPUT_MAX_SIZE, 1024),
   max_process_count: Number(process.env.SANDBOX_MAX_PROCESS_COUNT ?? 64),
   max_open_files: Number(process.env.SANDBOX_MAX_OPEN_FILES ?? 2048),
   max_file_size: Number(process.env.SANDBOX_MAX_FILE_SIZE ?? 10000000),
@@ -65,6 +65,41 @@ export const config = {
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
   max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
   per_job_uids: (process.env.SANDBOX_PER_JOB_UIDS ?? 'true') === 'true',
+  /* Image-level enable for persistent session workspaces (stateful sessions).
+   * Only the Lambda MicroVM runner target sets this true; the K8s
+   * sandbox-runner image leaves it false so it is structurally incapable of
+   * session mode. An enabled runner additionally binds each request to a
+   * workspace through the authenticated X-Runtime-Session-Id header. */
+  session_workspace_enabled: (process.env.SANDBOX_SESSION_WORKSPACE_ENABLED ?? 'false') === 'true',
+  external_workspace_enabled: (process.env.SANDBOX_EXTERNAL_WORKSPACE_ENABLED ?? 'false') === 'true',
+  external_workspace_root: cleanDirectory(process.env.SANDBOX_EXTERNAL_WORKSPACE_ROOT)
+    ?? '/mnt/workspace',
+  external_workspace_token: process.env.SANDBOX_EXTERNAL_WORKSPACE_TOKEN ?? '',
+  /**
+   * Enables the Lambda-only hosted-app runner surface. This must only be set
+   * on a dedicated app-host MicroVM image: user application processes share
+   * that VM's network namespace and are therefore intentionally never started
+   * by the ordinary stateless/session execution runner.
+   */
+  hosted_apps_enabled: (process.env.SANDBOX_HOSTED_APPS_ENABLED ?? 'false') === 'true',
+  hosted_app_port: safeInt(process.env.SANDBOX_HOSTED_APP_PORT, 3000),
+  hosted_app_start_timeout_ms: safeInt(
+    process.env.SANDBOX_HOSTED_APP_START_TIMEOUT_MS,
+    30_000,
+  ),
+  hosted_app_stop_timeout_ms: safeInt(
+    process.env.SANDBOX_HOSTED_APP_STOP_TIMEOUT_MS,
+    5_000,
+  ),
+  hosted_app_log_max_bytes: safeInt(
+    process.env.SANDBOX_HOSTED_APP_LOG_MAX_BYTES,
+    64 * 1024,
+  ),
+  hosted_app_memory_max_bytes: safeInt(
+    process.env.SANDBOX_HOSTED_APP_MEMORY_MAX_BYTES,
+    2 * 1024 * 1024 * 1024,
+  ),
+  hosted_app_pids_max: safeInt(process.env.SANDBOX_HOSTED_APP_PIDS_MAX, 128),
   job_uid_base: safeInt(process.env.SANDBOX_JOB_UID_BASE, 200000),
   job_gid_base: safeInt(process.env.SANDBOX_JOB_GID_BASE, 200000),
   job_uid_count: safeInt(
@@ -77,7 +112,31 @@ export const config = {
   nsjail_path: process.env.NSJAIL_PATH ?? '/usr/sbin/nsjail',
   nsjail_config: process.env.NSJAIL_CONFIG ?? '/sandbox_api/config/sandbox.cfg',
   execute_body_limit: process.env.SANDBOX_EXECUTE_BODY_LIMIT ?? '50mb',
+  /* Independent runner-side ceiling for streamed checkpoint restores. The
+   * control plane enforces the same default, but the receiver must not trust a
+   * caller-supplied Content-Length or upstream enforcement. */
+  checkpoint_max_bytes: safeInt(
+    process.env.SANDBOX_CHECKPOINT_MAX_BYTES,
+    512 * 1024 * 1024,
+  ),
+  /* Ceiling for the pushed input cache (session-inputs.ts). Eviction is
+   * always safe — a miss simply re-pushes on the next probe — so this is a
+   * disk guard, not a correctness knob. */
+  http_input_cache_enabled:
+    (process.env.SANDBOX_HTTP_INPUT_CACHE_ENABLED ?? 'true') === 'true',
+  http_input_cache_max_objects: safeInt(process.env.SANDBOX_HTTP_INPUT_CACHE_MAX_OBJECTS, 4096),
+  http_input_cache_max_inflight: safeInt(process.env.SANDBOX_HTTP_INPUT_CACHE_MAX_INFLIGHT, 16),
+  input_cache_max_bytes: safeInt(
+    process.env.SANDBOX_INPUT_CACHE_MAX_BYTES,
+    512 * 1024 * 1024,
+  ),
+  /* Bound both validation cost and per-request priming fan-out. The cache's
+   * unique-object cap is not enough because one object may be requested at
+   * many destinations. */
+  max_input_files: safeInt(process.env.SANDBOX_MAX_INPUT_FILES, 256),
+  prime_concurrency: safeInt(process.env.SANDBOX_PRIME_CONCURRENCY, 8),
   egress_gateway_url: egressGatewayUrl,
+  file_relay_token: process.env.SANDBOX_FILE_RELAY_TOKEN ?? '',
   file_server_url: process.env.FILE_SERVER_URL ?? '',
   max_nesting_depth: safeInt(process.env.SANDBOX_MAX_NESTING_DEPTH, 10),
   max_path_length: safeInt(process.env.SANDBOX_MAX_PATH_LENGTH, 256),

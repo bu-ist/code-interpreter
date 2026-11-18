@@ -3,31 +3,88 @@ import busboy from 'busboy';
 import { nanoid } from 'nanoid';
 import { Router } from 'express';
 import type { Response } from 'express';
-import type { Readable } from 'stream';
+import { Readable } from 'stream';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
 import { sessionAuth } from '../middleware/auth';
-import { executionLimiter, uploadLimiter, downloadLimiter, fetchLimiter } from '../middleware/limits';
+import {
+  executionLimiter,
+  uploadLimiter,
+  downloadLimiter,
+  fetchLimiter,
+  deleteLimiter,
+} from '../middleware/limits';
 import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
-import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
+import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, queueNames, connection } from '../queue';
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
-import { env, planLimits, resolveLanguage } from '../config';
+import { env, jobCompletionWaitTimeoutMs, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
 import { getExecutionIdentity } from '../execution-identity';
+import { resolveRuntimeSessionIdForExecRequest, RuntimeSessionHintError } from '../runtime-session/id';
 import { jobsSubmitted } from '../metrics';
 import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
-import { prepareSandboxJobSecurity } from '../sandbox-egress';
+import { createUploadSessionRegistrar } from './upload-session';
+import { recordSessionOwnership } from '../session-ownership';
+import { normalizeProgrammaticTimeoutMs, prepareSandboxJobSecurity } from '../sandbox-egress';
+import {
+  BridgeWorkerSelectionError,
+  CODEAPI_BRIDGE_WORKER_HEADER,
+  resolveBridgeWorkerSelection,
+} from '../bridge/selection';
 import logger from '../logger';
+import { resolveQueuedSandboxBackend } from '../execution-profile';
 
 const { INSTANCE_ID } = env;
+const JOB_COMPLETION_WAIT_TIMEOUT_MS = jobCompletionWaitTimeoutMs(
+  env.JOB_TIMEOUT,
+  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
+  env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
+);
 
 const UPLOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * Streams one busboy file part to the file-server.
+ *
+ * Uses the global `fetch` rather than axios on purpose. axios routes a
+ * stream body through `node:http`'s `ClientRequest`, and on Bun (the
+ * runtime in `Dockerfile.api`) that client can drop the tail of a
+ * chunked request body: every byte is accepted by `write()`, `end()`
+ * is called after the last write, yet the peer receives 32 KiB-800 KiB
+ * less and the file-server stores a short object while reporting
+ * success (reproduced on Bun 1.3.10-1.3.14 with a 20 MiB upload; a
+ * 1 MiB upload is unaffected). Bun's native `fetch` and Node's undici
+ * stream the same body intact. busboy's `limits.fileSize` already caps
+ * the part, so no separate body-length guard is needed here.
+ */
+async function putFileToFileServer(
+  url: string,
+  file: Readable,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+): Promise<t.UploadResult> {
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers,
+    body: Readable.toWeb(file) as unknown as ReadableStream,
+    signal,
+    /* Required by the WHATWG fetch spec for streamed request bodies. */
+    duplex: 'half',
+  } as RequestInit);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(
+      `file-server responded ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`,
+    );
+  }
+  return (await response.json()) as t.UploadResult;
+}
 /* Batch cap sized for skill-priming uploads: a single skill (e.g. pptx)
  * can carry 60+ resource files including .xsd schemas, helper scripts,
  * docs, and Python __init__.py markers. The previous cap of 20 silently
@@ -133,6 +190,52 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
+  // An omitted cap keeps the worker's existing language-specific default.
+  let timeout: number | undefined;
+  try {
+    if (body.timeout != null) timeout = normalizeProgrammaticTimeoutMs(body.timeout);
+  } catch (error) {
+    return res.status(400).json({ error: (error as Error).message });
+  }
+
+  let bridgeWorkerId: string | undefined;
+  try {
+    const bridgeSelection = resolveBridgeWorkerSelection({
+      backend: env.SANDBOX_BACKEND,
+      configuredWorkerId: env.BRIDGE_WORKER_ID,
+      dynamicWorkers: env.BRIDGE_DYNAMIC_WORKERS,
+      requestedWorkerId: req.header(CODEAPI_BRIDGE_WORKER_HEADER),
+      trustedWorkerId: principal.codeWorkerId,
+    });
+    bridgeWorkerId = bridgeSelection?.explicit === true
+      ? bridgeSelection.workerId
+      : undefined;
+  } catch (error) {
+    if (error instanceof BridgeWorkerSelectionError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+
+  let runtimeSessionId: string | undefined;
+  try {
+    runtimeSessionId = resolveRuntimeSessionIdForExecRequest({
+      mode: env.RUNTIME_SESSION_MODE,
+      storageNamespace: identity.storageNamespace,
+      canonicalUserId: identity.canonicalUserId,
+      runtimeSessionHint: body.runtime_session_hint,
+      isSynthetic: isSyntheticRequest,
+    });
+  } catch (error) {
+    if (error instanceof RuntimeSessionHintError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+  const runtimeSessionMode: t.RuntimeSessionMode = runtimeSessionId == null
+    ? 'stateless'
+    : env.RUNTIME_SESSION_MODE;
+
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
@@ -168,7 +271,16 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
    * sandbox invocation." */
   const session_id = nanoid();
   const execution_id = nanoid();
-  await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
+  /* Guarded: registration runs before the route's `try`, and Express 4
+   * does not forward a rejected async handler to the error middleware —
+   * an unavailable Redis, or an ACL that permits `session:*` but not
+   * `session-owner:*`, would hang the request instead of answering. */
+  try {
+    await recordSessionOwnership(connection, session_id, sessionKey);
+  } catch (error) {
+    logger.error(`[${INSTANCE_ID}] Error registering session ownership - Session ID: ${session_id}:`, error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 
   try {
     if (!isSyntheticRequest) {
@@ -189,6 +301,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       isPyPlot,
       session_id,
     });
+    if (timeout != null) rawPayload.run_timeout = timeout;
     const sandboxSecurity = prepareSandboxJobSecurity({
       req,
       executionId: execution_id,
@@ -200,12 +313,13 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
     const queue = language === Languages.py ? pyQueue : otherQueue;
     const queueEvents = language === Languages.py ? pyQueueEvents : otherQueueEvents;
-    const queueName = language === Languages.py ? 'python' : 'other';
+    const queueName = language === Languages.py ? queueNames.python : queueNames.other;
 
     const job = await withSpan('codeapi.job.enqueue', {
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
+      'codeapi.execution_profile': env.EXECUTION_PROFILE,
     }, () => {
       const traceCarrier = captureTraceCarrier();
       return queue.add(Jobs.execute, {
@@ -219,6 +333,15 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         executionId: execution_id,
         tenantId: identity.storageNamespace,
         canonicalUserId: identity.canonicalUserId,
+        executionProfile: env.EXECUTION_PROFILE,
+        sandboxBackend: resolveQueuedSandboxBackend(
+          env.EXECUTION_PROFILE,
+          env.SANDBOX_BACKEND,
+          env.EXECUTION_PROFILE_SOURCE,
+        ),
+        ...(bridgeWorkerId != null ? { bridgeWorkerId } : {}),
+        ...(runtimeSessionId != null ? { runtimeSessionId } : {}),
+        runtimeSessionMode,
         executionManifestClaims: sandboxSecurity.executionManifestClaims,
         egressGrantClaims: sandboxSecurity.egressGrantClaims,
         egressGrantToken: sandboxSecurity.egressGrantToken,
@@ -251,7 +374,8 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+      'codeapi.execution_profile': env.EXECUTION_PROFILE,
+    }, () => job.waitUntilFinished(queueEvents, JOB_COMPLETION_WAIT_TIMEOUT_MS), 'CONSUMER');
 
     if (!isSyntheticRequest) {
       logger.info('Execution completed', { session_id, user_id });
@@ -334,6 +458,8 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize },
+      defCharset: 'utf8',
+      defParamCharset: 'utf8',
       preservePath: true,
     });
 
@@ -404,9 +530,6 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
           reject(err instanceof Error ? err : new Error(String(err)));
           return;
         }
-        connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
-        logger.info(`[${INSTANCE_ID}] Upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
-
         const putHeaders: Record<string, string> = {
           'Content-Type': mimeType,
           /* file-server URL-decodes this header before storing metadata.
@@ -417,26 +540,31 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
         if (readOnly) {
           putHeaders['X-Read-Only'] = 'true';
         }
-        axios.put<t.UploadResult>(
+        recordSessionOwnership(connection, session_id, sessionKey)
+          .then(() => {
+            logger.info(`[${INSTANCE_ID}] Upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
+            return putFileToFileServer(
           `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}`,
           file,
-          {
-            headers: internalServiceHeaders(putHeaders),
-            maxBodyLength: planFileSize,
-            maxContentLength: planFileSize,
-            signal: abortController.signal,
-          }
-        )
-          .then(response => {
+          internalServiceHeaders(putHeaders),
+          abortController.signal,
+        );
+          })
+          .then(result => {
             clearTimeout(uploadTimeout);
-            resolve(response.data);
+            resolve(result);
           })
           .catch(error => {
             clearTimeout(uploadTimeout);
+            file.resume();
             reject(error);
           });
       });
 
+      /* Busboy may take additional event-loop turns to drain the multipart
+       * body before `finish` aggregates this promise. Mark early failures as
+       * observed while preserving the original promise for Promise.all. */
+      void uploadPromise.catch(() => undefined);
       uploadPromises.push(uploadPromise);
     });
 
@@ -514,7 +642,6 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     let uploadId: string | undefined;
     let uploadVersionRaw: string | undefined;
     let readOnly = false;
-    let sessionKeySet = false;
     let hasResponded = false;
     let filesLimitReached = false;
     /* `SessionKeyResolutionError.status` spans 400 | 500 — 400 is a
@@ -525,12 +652,22 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
      * 500 we see and convert it into a single 500 batch response on
      * `bb.on('finish')`. */
     let serverError: SessionKeyResolutionError | undefined;
+    /* Redis registration is also a batch-level dependency fault. Keep file
+     * promises fulfilled while Busboy drains, then surface one 500. */
+    let sessionRegistrationError: Error | undefined;
+
+    const ensureSessionRegistered = createUploadSessionRegistrar((sessionKey) => {
+      logger.info(`[${INSTANCE_ID}] Batch upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
+      return recordSessionOwnership(connection, session_id, sessionKey);
+    });
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
     /* See note on the single-upload busboy above for why preservePath is set. */
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize, files: MAX_BATCH_FILES },
+      defCharset: 'utf8',
+      defParamCharset: 'utf8',
       preservePath: true,
     });
 
@@ -572,6 +709,13 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
         const uploadTimeout = setTimeout(() => {
           abortController.abort('timeout');
           file.resume();
+          /* If Redis is still pending, make that shared registration barrier
+           * fail before any file promise settles. This prevents Busboy from
+           * finishing with a 400 while a later Redis rejection arrives too
+           * late to be surfaced as the batch-level dependency failure. */
+          if (ensureSessionRegistered.rejectPending(
+            new Error('Upload session registration timed out'),
+          )) return;
           resolve({ status: 'error', filename, error: 'Upload timeout' });
         }, UPLOAD_TIMEOUT_MS);
 
@@ -608,12 +752,6 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
           resolve({ status: 'error', filename, error: message });
           return;
         }
-        if (!sessionKeySet) {
-          connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
-          sessionKeySet = true;
-          logger.info(`[${INSTANCE_ID}] Batch upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
-        }
-
         const putHeaders: Record<string, string> = {
           'Content-Type': mimeType,
           /* file-server URL-decodes this header before storing metadata.
@@ -624,31 +762,38 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
         if (readOnly) {
           putHeaders['X-Read-Only'] = 'true';
         }
-        axios.put<t.UploadResult>(
+        const failSessionRegistration = (error: unknown): void => {
+          clearTimeout(uploadTimeout);
+          file.resume();
+          const normalizedError = error instanceof Error ? error : new Error(String(error));
+          sessionRegistrationError ??= normalizedError;
+          resolve({ status: 'error', filename, error: 'Failed to register upload session' });
+        };
+        const resolveUploadFailure = (error: unknown): void => {
+          clearTimeout(uploadTimeout);
+          if (abortController.signal.aborted) {
+            const reason = abortController.signal.reason === 'timeout' ? 'Upload timeout' : 'File size limit exceeded';
+            resolve({ status: 'error', filename, error: reason });
+            return;
+          }
+          file.resume();
+          const message = error instanceof Error ? error.message : 'Unknown upload error';
+          logger.error(`[${INSTANCE_ID}] Batch upload file failed: ${filename} | Session: ${session_id}`, { error: message });
+          resolve({ status: 'error', filename, error: message });
+        };
+        const forwardFile = (): Promise<void> => putFileToFileServer(
           `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}`,
           file,
-          {
-            headers: internalServiceHeaders(putHeaders),
-            maxBodyLength: planFileSize,
-            maxContentLength: planFileSize,
-            signal: abortController.signal,
-          }
-        )
-          .then(response => {
-            clearTimeout(uploadTimeout);
-            resolve({ status: 'success', filename: response.data.filename, fileId: response.data.fileId });
-          })
-          .catch(error => {
-            clearTimeout(uploadTimeout);
-            if (abortController.signal.aborted) {
-              const reason = abortController.signal.reason === 'timeout' ? 'Upload timeout' : 'File size limit exceeded';
-              resolve({ status: 'error', filename, error: reason });
-              return;
-            }
-            const message = error instanceof Error ? error.message : 'Unknown upload error';
-            logger.error(`[${INSTANCE_ID}] Batch upload file failed: ${filename} | Session: ${session_id}`, { error: message });
-            resolve({ status: 'error', filename, error: message });
-          });
+          internalServiceHeaders(putHeaders),
+          abortController.signal,
+        ).then(result => {
+          clearTimeout(uploadTimeout);
+          resolve({ status: 'success', filename: result.filename, fileId: result.fileId });
+        }, resolveUploadFailure);
+
+        void ensureSessionRegistered(sessionKey)
+          .then(forwardFile, failSessionRegistration)
+          .catch(failSessionRegistration);
       });
 
       uploadPromises.push(uploadPromise);
@@ -674,6 +819,15 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
       try {
         const results = await Promise.all(uploadPromises);
 
+        if (sessionRegistrationError) {
+          logger.error(
+            `[${INSTANCE_ID}] Batch upload session registration failed for session ${session_id}:`,
+            sessionRegistrationError,
+          );
+          res.status(500).json({ error: 'Error registering upload session' });
+          return;
+        }
+
         /* If sessionKey resolution faulted with a 500 status (server
          * misconfiguration — see `serverError` declaration above),
          * surface the fault as a single batch-level 500 instead of
@@ -694,9 +848,9 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
           return;
         }
 
-        /* SessionKey was set inline in the per-file handler under
-         * `sessionKeySet`. No batch-level fallback needed: if zero files
-         * succeeded, no session was created. */
+        /* SessionKey was set inline in the per-file handler through
+         * `ensureSessionRegistered`. No batch-level fallback is needed when
+         * no valid file reaches the forwarding step. */
 
         let succeeded = 0;
         let failed = 0;
@@ -804,7 +958,15 @@ router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, a
   }
 });
 
-router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
+/**
+ * Remove a session object.
+ *
+ * Mounted on two paths (see the registrations below); both are gated by
+ * `sessionAuth`, so the caller has to own the `(session_id, entity_id)`
+ * pair the object was stored under, and both proxy the same file-server
+ * route.
+ */
+const deleteSessionObject = async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
   try {
@@ -817,12 +979,46 @@ router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (re
     logger.info(`[${INSTANCE_ID}] File deleted: Session ID: ${session_id} | File ID: ${fileId}`);
     return res.status(200).json(response.data);
   } catch (error) {
+    /* The file-server answers 404 when the object is already gone. Pass
+     * that through instead of collapsing it into a 500: a client sweeping
+     * expired files can retire the reference on 404, whereas a 500 reads
+     * as retryable and has it re-issuing the same DELETE for an object
+     * that no longer exists on every subsequent pass. */
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      /* Best effort: this runs inside the catch block, where a rejection
+       * has no handler above it — Express 4 does not forward async
+       * rejections, so it would hang the request instead of answering.
+       * The key expires on its own, and the object is already gone. */
+      await connection.del(`upload:${req.sessionKey}${session_id}${fileId}`).catch((err: unknown) => {
+        logger.warn(`[${INSTANCE_ID}] Failed to clear upload key for absent file - Session ID: ${session_id} | File ID: ${fileId}:`, err);
+      });
+      logger.info(`[${INSTANCE_ID}] File already absent: Session ID: ${session_id} | File ID: ${fileId}`);
+      return res.status(404).json({ error: 'File not found' });
+    }
     const errorDetails = getAxiosErrorDetails(error);
     logger.error(`[${INSTANCE_ID}] Error deleting file - Session ID: ${session_id} | File ID: ${fileId}:`, errorDetails);
     return res.status(500).json({
       error: 'Error deleting file',
     });
   }
-});
+};
+
+router.delete('/files/:session_id/:fileId', deleteLimiter, sessionAuth, deleteSessionObject);
+
+/**
+ * Alias of the route above, on the path LibreChat's `deleteCodeEnvFile`
+ * targets — the file-server's own DELETE path, which is not itself
+ * exposed on `/v1`.
+ *
+ * Until LibreChat v0.8.6 this was the only path the client tried, and the
+ * 404 from an unmounted method was indistinguishable from "the object is
+ * already gone": every deletion silently failed and objects accumulated
+ * with nothing to alert on. Newer clients fall back to `/files/...`, but
+ * mounting the alias costs nothing and makes deletion work for
+ * deployments still running an older client.
+ *
+ * GET on this same path is the metadata proxy above.
+ */
+router.delete('/sessions/:session_id/objects/:fileId', deleteLimiter, sessionAuth, deleteSessionObject);
 
 export default router;

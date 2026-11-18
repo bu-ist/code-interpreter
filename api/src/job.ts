@@ -7,14 +7,16 @@ import * as fsp from 'fs/promises';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
 import type { Logger } from 'pino';
+import type { ArtifactDeliveryFailure } from './delivery';
 import type { NsJailResult } from './nsjail';
 import type { Runtime } from './runtime';
 import { logger as rootLogger } from './logger';
 import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
+import { recordCleanupResources } from './cleanup-metrics';
 import { internalServiceHeaders } from './internal-service-auth';
-import { EGRESS_GRANT_HEADER } from './egress';
+import { EGRESS_GRANT_HEADER, EGRESS_ERROR_CODE_HEADER } from './egress';
 import { injectTraceHeaders } from './telemetry';
 import {
   applyReadOnlyInputPermissions,
@@ -22,28 +24,34 @@ import {
   applySandboxPathPermissionsNoFollow,
   cleanupSandboxWorkspace,
   createSandboxWorkspace,
+  ensureDirNoFollow,
   fallbackSandboxIdentity,
   retainWorkspaceCleanupUntilRemoved,
   sandboxJobUidPool,
   type SandboxJobIdentity,
   type SandboxWorkspaceLease,
 } from './workspace-isolation';
+import type { SessionWorkspace } from './session-workspace';
 import {
   DIRKEEP,
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
   ValidationError,
+  checkPathShape,
+  hasRunnableSource,
   isDirkeep,
-  isValidPathShape,
   validateFilePath,
   isValidFilePath,
 } from './validation';
+import { fetchCachedHttpInput } from './http-input-cache';
+import { cachedInputResponse, inputCacheKey, openCachedInput } from './session-inputs';
 
 export {
   DIRKEEP,
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
   ValidationError,
+  hasRunnableSource,
   isDirkeep,
   checkPathShape,
   isValidPathShape,
@@ -52,6 +60,24 @@ export {
 } from './validation';
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
+const AUTO_LOAD_DIRKEEP_RETRIES = 2;
+const PTC_HISTORY_FILENAME = '_ptc_history.json';
+const TRUNCATION_PROBE_MAX_ENTRIES = 1000;
+const TRUNCATION_PROBE_MAX_LEVELS = 10;
+const TRUNCATION_PROBE_MAX_HASH_BYTES = 50_000_000;
+
+interface TruncationProbeState {
+  remainingEntries: number;
+  remainingHashBytes: number;
+}
+
+/** Replaying the same sealed grant cannot repair an authorization denial. */
+class InputAuthorizationError extends Error {
+  constructor(status: number) {
+    super(`HTTP error: ${status}`);
+    this.name = 'InputAuthorizationError';
+  }
+}
 
 /**
  * Bridges a `fetch` response body to a Node-stream Readable. The types at the
@@ -157,39 +183,12 @@ export function ensureNodeModulesSymlink(
 }
 
 /**
- * Extracts the on-disk filename from a Content-Disposition response header,
- * falling back to the request-supplied `file.name` (or `file.id` if no name
- * was provided). Pure; exported for unit testing.
- *
- * Matches RFC 5987 / 8187 `filename*=UTF-8''<percent-encoded>` first because
- * the file server emits that form for UTF-8-safe transport of arbitrary
- * names — including paths with `/` separators that the legacy `filename=`
- * form would mangle. Falls back to the legacy quoted (`filename="..."`) or
- * unquoted (`filename=...`) forms, each stopping at the closing quote or
- * the first whitespace/semicolon so trailing params like
- * `attachment; filename="foo.txt"; size=123` correctly yield `foo.txt`.
+ * Resolves the on-disk destination for a by-reference input. The request owns
+ * the sandbox path; object response metadata must not redirect the write.
+ * Pure; exported for unit testing.
  */
-export function resolveOriginalName(response: Response, file: TFile): string {
-  const fallback = file.name || (file.id ?? '');
-  const header = response.headers.get('content-disposition');
-  if (!header) return fallback;
-
-  const star = header.match(/filename\*=(?:UTF-8'[^']*')?([^;]+)/i);
-  if (star) {
-    const raw = star[1].trim();
-    try {
-      return decodeURIComponent(raw);
-    } catch {
-      /* Malformed percent-encoding (e.g. `%ZZ`) — fall through to the legacy
-       * forms. The same header may emit both `filename*=` and a legacy
-       * `filename=` per RFC 5987 §4.3, so a corrupt extended form should
-       * not poison a valid fallback. */
-    }
-  }
-
-  const match = header.match(/filename="([^"]+)"/i)
-    ?? header.match(/filename=([^\s;]+)/i);
-  return match ? match[1] : fallback;
+export function resolveInputDestination(file: TFile): string {
+  return file.name || (file.id ?? '');
 }
 
 /**
@@ -573,6 +572,9 @@ export interface TFile {
    *  storage). Distinct from the top-level execution session of a `/exec`
    *  call — those are different concepts and were historically conflated. */
   storage_session_id?: string;
+  /** Stable opaque identity supplied by the control plane when sandbox-visible
+   * ids are per-execution handles. Never used as a filesystem path directly. */
+  input_cache_key?: string;
   name: string;
   content?: string;
   encoding?: 'base64' | 'hex' | 'utf8';
@@ -628,6 +630,24 @@ interface InputFileInfo {
   readOnly?: boolean;
 }
 
+interface PrimeOperationContext {
+  /** Captured before any file operation starts. Cleanup clears the Job fields,
+   * so asynchronous priming code must never re-read them after an await. */
+  submissionDir: string;
+  identity: SandboxJobIdentity;
+  signal?: AbortSignal;
+}
+
+export class SessionWorkspaceDirtyError extends Error {
+  readonly code = 'session_workspace_dirty';
+
+  constructor(cause?: unknown) {
+    super('Session input priming did not complete; the workspace must be restored');
+    this.name = 'SessionWorkspaceDirtyError';
+    this.cause = cause;
+  }
+}
+
 interface ExecuteResult {
   compile?: NsJailResult;
   run?: NsJailResult;
@@ -636,7 +656,22 @@ interface ExecuteResult {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
+  /** Persisted input paths that no longer exist after this execution. */
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 }
+
+export type ArtifactTruncationReason = 'max_files' | 'depth' | 'size' | 'path' | 'unreadable';
+
+export interface ArtifactTruncation {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  skipped: string[];
+  skipped_count: number;
+}
+
+const MAX_REPORTED_TRUNCATED_PATHS = 20;
 
 const jobQueue: Array<() => void> = [];
 
@@ -675,11 +710,29 @@ export class Job {
   private workspaceLease: SandboxWorkspaceLease | undefined;
   private jobIdentity: SandboxJobIdentity | undefined;
   private generatedFiles: GeneratedFile[] = [];
+  /** Session output-diffing: fileId → {name, signature} pending a surfaced-mark.
+   *  Recorded during the workspace scan but only committed to `session.surfaced`
+   *  AFTER the file uploads, so a dropped upload doesn't permanently suppress an
+   *  unchanged file on the next turn. */
+  private pendingSurfaced = new Map<string, { name: string; signature: string }>();
   private sessionFiles: FileRef[] = [];
   private inheritedRefs: FileRef[] = [];
+  private presentInputFiles = new Set<string>();
+  private deletedFiles: string[] = [];
+  private artifactTruncation: ArtifactTruncation | undefined;
+  private truncationProbeState: TruncationProbeState = {
+    remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
+    remainingHashBytes: TRUNCATION_PROBE_MAX_HASH_BYTES,
+  };
   private inputFileHashes = new Map<string, InputFileInfo>();
+  private inputManifest = new Map<TFile, unknown>();
+  private inputDestinations = new Map<string, TFile>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
+  /* Persistent session workspace (stateful mode). When set, the job reuses
+   * one long-lived workspace + pinned UID across calls instead of a fresh
+   * per-job workspace; undefined = legacy fresh-per-job path (unchanged). */
+  private readonly session: SessionWorkspace | undefined;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -698,7 +751,10 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
+    /* Injected when this VM is bound to a stateful runtime session. */
+    session?: SessionWorkspace | null;
   }) {
+    this.session = opts.session ?? undefined;
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
     this.log = rootLogger.child({ job: this.uuid });
@@ -710,6 +766,7 @@ export class Job {
        * historically these collapsed onto the same `session_id` field
        * which is exactly the conflation this rename eliminates. */
       storage_session_id: file.storage_session_id ?? this.outputSessionId,
+      input_cache_key: file.input_cache_key,
       name: file.name || `file${i}.code`,
       content: file.content,
       encoding: (['base64', 'hex', 'utf8'] as const).includes(file.encoding as 'base64' | 'hex' | 'utf8')
@@ -733,13 +790,29 @@ export class Job {
     this.isSynthetic = opts.is_synthetic === true;
   }
 
+  /** Marks a persistent workspace unusable after a post-prime failure. Returns
+   * false for stateless jobs so the route can retain its ordinary error shape. */
+  markSessionDirty(reason: string): boolean {
+    if (!this.session) return false;
+    this.session.markDirty(reason);
+    return true;
+  }
+
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
     const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath, noFollow
-      ? { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }
-      : undefined);
-    for await (const chunk of stream) hash.update(chunk as Buffer);
-    return hash.digest('hex');
+    /* Numeric open flags are only typed on fsp.open; `createReadStream`'s
+     * options want a string mode with no O_NOFOLLOW spelling, so open the
+     * handle first and stream from it. */
+    const handle = noFollow
+      ? await fsp.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+      : undefined;
+    try {
+      const stream = handle ? handle.createReadStream() : fs.createReadStream(filePath);
+      for await (const chunk of stream) hash.update(chunk as Buffer);
+      return hash.digest('hex');
+    } finally {
+      await handle?.close().catch(() => {});
+    }
   }
 
   /**
@@ -762,12 +835,16 @@ export class Job {
     return this.jobIdentity ?? fallbackSandboxIdentity();
   }
 
-  private async applySandboxFilePermissions(filePath: string, noFollow = false): Promise<void> {
+  private async applySandboxFilePermissions(
+    filePath: string,
+    noFollow = false,
+    identity = this.sandboxIdentity(),
+  ): Promise<void> {
     if (noFollow) {
-      await applySandboxPathPermissionsNoFollow(filePath, this.sandboxIdentity(), SANDBOX_FILE_MODE, 'file');
+      await applySandboxPathPermissionsNoFollow(filePath, identity, SANDBOX_FILE_MODE, 'file');
       return;
     }
-    await applySandboxPathPermissions(filePath, this.sandboxIdentity(), SANDBOX_FILE_MODE);
+    await applySandboxPathPermissions(filePath, identity, SANDBOX_FILE_MODE);
   }
 
   /**
@@ -775,25 +852,116 @@ export class Job {
    * (inclusive) so the per-job outside UID can create siblings/children while
    * escaped sibling UIDs cannot traverse the workspace tree.
    */
-  private async secureAncestors(leaf: string): Promise<void> {
-    const rel = path.relative(this.submissionDir, leaf);
+  /**
+   * Creates every directory from submissionDir (exclusive) to `target`
+   * (inclusive) one component at a time, refusing to descend through a symlink.
+   * `fsp.mkdir(dir, { recursive: true })` would instead follow a symlinked
+   * ancestor a prior session turn planted and create directories OUTSIDE the
+   * workspace as root — so a persistent-session prime must build the path with
+   * no-follow semantics before writing.
+   */
+  private ensureDirNoFollow(
+    target: string,
+    submissionDir = this.submissionDir,
+  ): Promise<void> {
+    /* Shared with the pushed-delivery merge (session-checkpoint.ts) so both
+     * privileged writers into a persistent workspace enforce identical
+     * no-follow semantics. `secureAncestors` applies the ownership pass here,
+     * so no identity is handed to the shared helper. */
+    return ensureDirNoFollow(submissionDir, target);
+  }
+
+  private async secureAncestors(
+    leaf: string,
+    submissionDir = this.submissionDir,
+    identity = this.sandboxIdentity(),
+  ): Promise<void> {
+    const rel = path.relative(submissionDir, leaf);
     if (!rel || rel === '..' || rel.startsWith('..' + path.sep)) return;
     const parts = rel.split(path.sep).filter(Boolean);
-    let cursor = this.submissionDir;
+    let cursor = submissionDir;
     for (const part of parts) {
       cursor = path.join(cursor, part);
       /* Parallel downloads under shared parent dirs call into this method
        * concurrently. Skip paths we've already chmodded to avoid N*M redundant
        * syscalls (N files × M shared ancestors). */
       if (this.chmoddedDirs.has(cursor)) continue;
-      await applySandboxPathPermissions(cursor, this.sandboxIdentity(), SANDBOX_DIR_MODE);
+      /* A persistent session workspace can contain a symlink planted by a
+       * prior turn's sandbox code; priming through it as root would follow the
+       * link and write/chmod an arbitrary target outside the workspace. Reject
+       * a symlinked ancestor (lstat never follows) before touching it. Fresh
+       * per-job workspaces never contain one, so this is a no-op there. */
+      const st = await fsp.lstat(cursor);
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to prime through symlinked workspace path: ${path.relative(submissionDir, cursor)}`);
+      }
+      await applySandboxPathPermissions(cursor, identity, SANDBOX_DIR_MODE);
       this.chmoddedDirs.add(cursor);
     }
   }
 
+  /**
+   * Atomically replaces this ref's provisional/previous aliases with its
+   * authoritative destination. There is no await in this transition: two
+   * concurrent downloads resolving to the same path cannot both pass the
+   * conflict check and start writing.
+   */
+  private reserveInputDestination(file: TFile, destination: string): void {
+    const conflict = [...this.inputDestinations.entries()].find(
+      ([reserved, owner]) =>
+        owner !== file
+        && (
+          reserved === destination
+          || reserved.startsWith(`${destination}/`)
+          || destination.startsWith(`${reserved}/`)
+        ),
+    );
+    if (conflict) {
+      throw new ValidationError(
+        `Conflicting input destinations: ${conflict[0]} and ${destination}`,
+      );
+    }
+    for (const [reserved, owner] of this.inputDestinations) {
+      if (owner === file && reserved !== destination) {
+        this.inputDestinations.delete(reserved);
+      }
+    }
+    this.inputDestinations.set(destination, file);
+  }
+
   async prime(): Promise<void> {
-    this.jobIdentity = await acquireJobIdentity(this.log);
-    this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
+    this.inputDestinations.clear();
+    this.inputManifest.clear();
+    const requestedDestinations = new Map<string, TFile>();
+    for (const file of this.files) {
+      validateFilePath(file.name, '/tmp/codeapi-request-validation');
+      const conflict = [...requestedDestinations.entries()].find(
+        ([destination, owner]) =>
+          owner !== file &&
+          (
+            destination === file.name ||
+            destination.startsWith(`${file.name}/`) ||
+            file.name.startsWith(`${destination}/`)
+          ),
+      );
+      if (conflict) {
+        throw new ValidationError(
+          `Conflicting input destinations: ${conflict[0]} and ${file.name}`,
+        );
+      }
+      requestedDestinations.set(file.name, file);
+      /* The request owns every sandbox destination. Reserve it before parallel
+       * priming begins so object metadata cannot redirect a later write. */
+      this.inputDestinations.set(file.name, file);
+    }
+
+    if (this.session) {
+      this.workspaceLease = await this.session.acquire();
+      this.jobIdentity = this.workspaceLease.identity;
+    } else {
+      this.jobIdentity = await acquireJobIdentity(this.log);
+      this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
+    }
     this.submissionDir = this.workspaceLease.dir;
 
     if (!this.isSynthetic) {
@@ -803,6 +971,7 @@ export class Job {
           workspaceId: this.workspaceLease.workspaceId,
           uid: this.jobIdentity.uid,
           gid: this.jobIdentity.gid,
+          session: this.session ? this.session.runtimeSessionId : undefined,
         },
         'Priming job',
       );
@@ -812,15 +981,158 @@ export class Job {
       await this.autoLoadDirkeep();
     }
 
-    const fileOps: Promise<void>[] = [];
+    await this.prepareInputManifest();
+
+    /* Promise.all rejects as soon as one operation fails, while its siblings
+     * keep running. The route's finally then calls cleanup(), which clears the
+     * session path/identity. A delayed sibling used to resume afterward and
+     * derive a relative destination from `submissionDir === ''`, writing under
+     * the runner's own cwd. Abort the siblings and, critically, wait for every
+     * operation to settle before exposing the failure to request cleanup. */
+    const controller = new AbortController();
+    const operationBase = {
+      submissionDir: this.submissionDir,
+      identity: this.jobIdentity,
+    };
+    const startedAt = performance.now();
+    let started = 0;
+    let completed = 0;
+    let cancelled = 0;
+    let firstFailure: { error: unknown } | undefined;
+    const runFileOperation = async (operation: () => Promise<void>): Promise<void> => {
+      started++;
+      try {
+        await operation();
+        completed++;
+      } catch (error) {
+        if (firstFailure) cancelled++;
+        if (!firstFailure) {
+          firstFailure = { error };
+          controller.abort(error);
+        }
+        throw error;
+      }
+    };
+
+    const fileOps: Array<() => Promise<void>> = [];
     for (const file of this.files) {
+      const operationContext: PrimeOperationContext = {
+        ...operationBase,
+        signal: controller.signal,
+      };
       if (file.id) {
-        fileOps.push(this.downloadAndWriteFile(file).then(() => {}));
+        fileOps.push(() => runFileOperation(() => this.primeInputFile(file, operationContext)));
       } else if (file.content !== undefined) {
-        fileOps.push(this.writeFile(file));
+        fileOps.push(() => runFileOperation(() => this.writeFile(file, operationContext)));
       }
     }
-    await Promise.all(fileOps);
+    let nextOperation = 0;
+    const runPrimeWorker = async (): Promise<void> => {
+      while (!controller.signal.aborted) {
+        const operationIndex = nextOperation++;
+        if (operationIndex >= fileOps.length) return;
+        await fileOps[operationIndex]();
+      }
+    };
+    const workerCount = Math.min(config.prime_concurrency, fileOps.length);
+    await Promise.allSettled(
+      Array.from({ length: workerCount }, () => runPrimeWorker()),
+    );
+    if (firstFailure) {
+      this.log.error({
+        inputCount: fileOps.length,
+        completed,
+        failed: 1,
+        cancelled,
+        notStarted: fileOps.length - started,
+        durationMs: Math.round(performance.now() - startedAt),
+        err: firstFailure.error,
+      }, 'Input preparation batch failed');
+      if (this.session) {
+        /* A sibling may already have atomically replaced its destination. The
+         * workspace now matches neither the previous checkpoint nor the full
+         * request, so keeping this VM would silently preserve partial input
+         * state. Fail closed and give the control plane a stable recycle signal. */
+        this.session.markDirty('input priming failed after file operations began');
+        throw new SessionWorkspaceDirtyError(firstFailure.error);
+      }
+      throw firstFailure.error;
+    }
+  }
+
+  /**
+   * Downloads an input file, or — in session mode when the same storage id is
+   * already present on disk from a prior call — skips the network fetch and
+   * hashes the local copy so modification detection still works.
+   */
+  private async primeInputFile(
+    file: TFile,
+    context: PrimeOperationContext,
+  ): Promise<void> {
+    throwIfAborted(context.signal);
+    if (this.session && file.id && (await this.reusePrimedInput(file, context))) {
+      /* Inherited markers are registered after prime's initial reservation
+       * pass, so reserve the verified requested path here as well. */
+      this.reserveInputDestination(file, file.name);
+      return;
+    }
+    const name = await this.downloadAndWriteFile(file, 5, 500, context);
+    if (this.session && file.id) {
+      /* Record read-only so the next turn re-downloads it (primedInputId reports
+       * read-only primes as not-primed) — a reused on-disk copy could have been
+       * tampered via the writable parent dir. Keep the original upload hash as
+       * the reuse baseline so a later turn detects prior in-place mutations. */
+      const primed = this.inputFileHashes.get(name);
+      this.session.markPrimed(
+        name,
+        this.inputIdentity(file),
+        primed?.readOnly === true,
+        primed?.hash,
+      );
+    }
+  }
+
+  private async reusePrimedInput(
+    file: TFile,
+    context?: PrimeOperationContext,
+  ): Promise<boolean> {
+    const session = this.session;
+    if (!session || !file.id) return false;
+    throwIfAborted(context?.signal);
+    if (session.primedInputId(file.name) !== this.inputIdentity(file)) return false;
+    const submissionDir = context?.submissionDir ?? this.submissionDir;
+    const filePath = path.join(submissionDir, file.name);
+    /* lstat/O_NOFOLLOW protect only their final path component. A prior
+     * sandbox turn can instead replace an ancestor with a symlink, making an
+     * outside regular file look reusable and bypassing the guarded download
+     * path. Keep this outside the missing-file fallback catch: a symlinked
+     * ancestor is a hard session-integrity failure, not a cache miss. */
+    await this.ensureDirNoFollow(path.dirname(filePath), submissionDir);
+    try {
+      const st = await fsp.lstat(filePath);
+      throwIfAborted(context?.signal);
+      if (!st.isFile()) return false;
+      /* Baseline against the ORIGINAL upload hash (recorded at prime time), not
+       * a re-hash of the on-disk copy: a prior turn may have mutated it in
+       * place, and re-hashing would bank the mutation as pristine and let the
+       * walker echo the original ref as unchanged. Falls back to hashing on
+       * disk if no original hash was retained. */
+      const hash = this.session?.primedHash(file.name) ?? (await this.computeFileHash(filePath, true));
+      this.inputFileHashes.set(file.name, {
+        originalId: file.id,
+        originalSessionId: file.storage_session_id,
+        hash,
+        path: filePath,
+        /* Carry the read-only bit into this run's input info: without it the
+         * output scan would treat a modified read-only input as a normal
+         * changed file and surface it, instead of dropping the modification
+         * per the read-only contract. */
+        readOnly: session.isPrimedReadOnly(file.name) || undefined,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private fileEgressBaseUrl(): string {
@@ -837,6 +1149,9 @@ export class Job {
     return injectTraceHeaders({
       ...headers,
       [EGRESS_GRANT_HEADER]: this.egressGrantToken,
+      ...(config.file_relay_token
+        ? { 'X-LibreChat-Code-Relay-Token': config.file_relay_token }
+        : {}),
     });
   }
 
@@ -849,8 +1164,11 @@ export class Job {
       .filter(f => !isDirkeep(f.name))
       .map(f => f.name);
 
-    const fetches = Array.from(sessionIds).map(sid => this.fetchSessionMarkers(sid));
-    const results = await Promise.all(fetches);
+    const results = await mapWithConcurrency(
+      Array.from(sessionIds),
+      config.prime_concurrency,
+      sid => this.fetchSessionMarkers(sid),
+    );
 
     let added = 0;
     let hitCap = false;
@@ -869,10 +1187,15 @@ export class Job {
     }
   }
 
+  private isLegacyGatewayDenial(response: Response): boolean {
+    return !!config.egress_gateway_url && response.status === 403 &&
+      !response.headers.has(EGRESS_ERROR_CODE_HEADER);
+  }
+
   /**
    * Fetches normalized objects for one inherited session and returns the
    * `.dirkeep` markers belonging to exactly that session. Guards against:
-   *   - non-OK responses (empty list, no throw)
+   *   - legacy 404 responses (no marker support) and transient backpressure
    *   - non-array JSON bodies
    *   - missing/malformed id/name/storage_session_id fields
    *   - MinIO prefix-list leakage (`abc` prefix also matches `abcdef/...`)
@@ -884,20 +1207,43 @@ export class Job {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), AUTO_LOAD_DIRKEEP_TIMEOUT_MS);
     try {
-      const res = await fetch(
-        `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(sid)}/objects?detail=normalized`,
-        {
-          headers: this.fileEgressHeaders(),
-          signal: controller.signal,
-        },
-      );
-      if (!res.ok) return [];
-      const data: unknown = await res.json();
-      if (!Array.isArray(data)) return [];
-      return data.filter(isNormalizedObjectForSession(sid));
+      for (let attempt = 0; attempt <= AUTO_LOAD_DIRKEEP_RETRIES; attempt += 1) {
+        const res = await fetch(
+          `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(sid)}/objects?detail=normalized`,
+          {
+            headers: this.fileEgressHeaders(),
+            signal: controller.signal,
+          },
+        );
+        if ((res.status === 503 || this.isLegacyGatewayDenial(res)) && attempt < AUTO_LOAD_DIRKEEP_RETRIES) {
+          await res.body?.cancel().catch(() => {});
+          const retryAfterSeconds = Number(res.headers.get('retry-after'));
+          await sleep(
+            Number.isFinite(retryAfterSeconds)
+              ? Math.min(1000, Math.max(25, retryAfterSeconds * 1000))
+              : 100,
+            controller.signal,
+          );
+          continue;
+        }
+        if (res.status === 404) {
+          await res.body?.cancel().catch(() => {});
+          return [];
+        }
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => {});
+          throw new Error(`HTTP error loading .dirkeep markers: ${res.status}`);
+        }
+        const data: unknown = await res.json();
+        if (!Array.isArray(data)) {
+          throw new Error('Invalid .dirkeep marker response');
+        }
+        return data.filter(isNormalizedObjectForSession(sid));
+      }
+      throw new Error('Exhausted .dirkeep marker retries');
     } catch (err) {
       this.log.warn({ sessionId: sid, err }, 'Failed to auto-load .dirkeep markers');
-      return [];
+      throw err;
     } finally {
       clearTimeout(timeout);
     }
@@ -935,40 +1281,88 @@ export class Job {
     return true;
   }
 
-  async downloadAndWriteFile(file: TFile, maxRetries = 5, retryDelay = 500): Promise<string | null> {
-    if (!file.id || !file.storage_session_id) return null;
+  async downloadAndWriteFile(
+    file: TFile,
+    maxRetries = 5,
+    retryDelay = 500,
+    context?: PrimeOperationContext,
+  ): Promise<string> {
+    const operation: PrimeOperationContext = context ?? {
+      submissionDir: this.submissionDir,
+      identity: this.sandboxIdentity(),
+    };
+    throwIfAborted(operation.signal);
+    if (!file.id || !file.storage_session_id) {
+      throw new ValidationError('By-reference inputs require id and storage_session_id');
+    }
 
-    validateFilePath(file.name, this.submissionDir);
+    validateFilePath(file.name, operation.submissionDir);
 
-    const tempPath = path.join(this.submissionDir, `.tmp-${nanoid()}`);
+    const tempPath = path.join(operation.submissionDir, `.tmp-${nanoid()}`);
 
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      let response: Response | undefined;
       try {
-        const response = await fetch(this.buildDownloadUrl(file), {
-          headers: this.fileEgressHeaders(),
-        });
+        throwIfAborted(operation.signal);
+        response = await this.fetchInputObject(file, operation.signal);
+        if (operation.signal?.aborted) {
+          await response.body?.cancel().catch(() => {});
+          throw abortReason(operation.signal);
+        }
 
         if (response.status === 404 && attempt < maxRetries) {
+          await response.body?.cancel().catch(() => {});
           const delay = retryDelay * Math.pow(2, attempt - 1);
           this.log.info({ fileId: file.id, attempt, maxRetries, delay }, 'File not found, retrying');
-          await sleep(delay);
+          await sleep(delay, operation.signal);
           continue;
         }
 
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          /* Older gateways also used 403 for transient ledger contention.
+           * Only classify 403 as permanent when the gateway distinguishes it. */
+          if (response.status === 401 ||
+            (response.status === 403 && !this.isLegacyGatewayDenial(response))) {
+            throw new InputAuthorizationError(response.status);
+          }
+          throw new Error(`HTTP error: ${response.status}`);
+        }
 
-        const originalName = resolveOriginalName(response, file);
-        validateFilePath(originalName, this.submissionDir);
-        const finalPath = path.join(this.submissionDir, originalName);
+        const destination = resolveInputDestination(file);
+        validateFilePath(destination, operation.submissionDir);
+        this.reserveInputDestination(file, destination);
+        const finalPath = path.join(operation.submissionDir, destination);
         const finalParent = path.dirname(finalPath);
-        await fsp.mkdir(finalParent, { recursive: true });
-        await this.secureAncestors(finalParent);
+        /* Persistent-session workspaces can hold a prior turn's symlink, so build
+         * ancestors no-follow; a fresh per-job workspace can use plain mkdir -p. */
+        if (this.session) await this.ensureDirNoFollow(finalParent, operation.submissionDir);
+        else await fsp.mkdir(finalParent, { recursive: true });
+        await this.secureAncestors(finalParent, operation.submissionDir, operation.identity);
+        /* Clear a symlink/dir a prior session turn may have squatted at the
+         * target so streamToDisk's rename lands a fresh regular file rather than
+         * following a link or failing on a directory. A regular file is LEFT in
+         * place and atomically replaced by that rename, so a failed/timed-out
+         * download can't delete prior session state before the replacement is
+         * safely written. */
+        if (this.session) {
+          const existing = await fsp.lstat(finalPath).catch(() => null);
+          if (existing && !existing.isFile()) {
+            await fsp.rm(finalPath, { force: true, recursive: true });
+          }
+        }
 
-        const hash = await this.streamToDisk(response, tempPath, finalPath);
+        const hash = await this.streamToDisk(
+          response,
+          tempPath,
+          finalPath,
+          operation.identity,
+          operation.signal,
+        );
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
-        this.inputFileHashes.set(originalName, {
+        this.inputFileHashes.set(destination, {
           originalId: file.id,
           originalSessionId: file.storage_session_id!,
           hash,
@@ -978,43 +1372,138 @@ export class Job {
         /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
          * sandbox UID can read them but cannot chmod them back to writable. */
         if (readOnly) {
-          try {
-            await applyReadOnlyInputPermissions(finalPath);
-          } catch (err) {
-            this.log.warn({ file: originalName, err }, 'Failed to chmod read-only input');
-          }
+          await applyReadOnlyInputPermissions(finalPath);
         }
 
-        /* Keep the in-memory TFile in sync with the on-disk name so that
-         * inputByName lookups in handleSessionFiles match walkDir's
-         * path.relative() output. Otherwise a Content-Disposition override
-         * would leave file.name pointing at the client-submitted name while
-         * the file lives under originalName on disk. */
-        if (originalName !== file.name) file.name = originalName;
-
-        this.log.info({ file: originalName, hash: hash.substring(0, 8) }, 'Downloaded file');
-        return originalName;
+        this.log.info({ file: destination, hash: hash.substring(0, 8) }, 'Downloaded file');
+        return destination;
       } catch (error: unknown) {
-        /* ValidationError is deterministic — a bad Content-Disposition
-         * filename will fail identically on every retry. Abort fast
-         * (cleanup + rethrow) instead of burning ~7.5s on exponential
-         * backoff and surfacing the error as a generic download failure. */
-        if (error instanceof ValidationError) {
+        if (response?.body && !response.bodyUsed) {
+          await response.body.cancel().catch(() => {});
+        }
+        if (operation.signal?.aborted) {
+          try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
+          throw abortReason(operation.signal);
+        }
+        /* Invalid filenames and authorization denials cannot recover by
+         * replaying the same request. Abort the batch before exponential
+         * backoff amplifies the failure across its remaining files. */
+        if (error instanceof ValidationError || error instanceof InputAuthorizationError) {
           try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
           throw error;
         }
         lastError = error instanceof Error ? error : new Error(String(error));
         if (attempt < maxRetries) {
-          const delay = retryDelay * Math.pow(2, attempt - 1);
+          const backoff = retryDelay * Math.pow(2, attempt - 1);
+          const retryAfterSeconds = response?.status === 503
+            ? Number(response.headers.get('retry-after')) : NaN;
+          /* Use the same bounded retry hint as marker discovery, without
+           * shortening exponential backoff or bypassing batch cancellation. */
+          const delay = Number.isFinite(retryAfterSeconds)
+            ? Math.max(backoff, Math.min(1000, Math.max(0, retryAfterSeconds * 1000)))
+            : backoff;
           this.log.warn({ fileId: file.id, attempt, maxRetries, delay, err: lastError }, 'Download failed, retrying');
-          await sleep(delay);
+          await sleep(delay, operation.signal);
         }
       }
     }
 
-    this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
+    if (!context?.signal) {
+      this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
+    }
     try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
-    return null;
+    throw lastError ?? new Error(`Failed to download input ${file.id}`);
+  }
+
+  private async prepareInputManifest(): Promise<void> {
+    if (!config.http_input_cache_enabled || !config.egress_gateway_url) return;
+    const files = this.files.filter(file => file.id && file.storage_session_id);
+    if (!files.length) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AUTO_LOAD_DIRKEEP_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${this.fileEgressBaseUrl()}/input-manifest`, {
+        method: 'POST', headers: this.fileEgressHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ files: files.map(file => ({
+          sessionHandle: file.storage_session_id, objectHandle: file.id,
+        })) }), signal: controller.signal,
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        return; // Older gateways/relays and transient failures use per-file preflight.
+      }
+      const manifest = await response.json() as { files?: unknown[] };
+      if (!Array.isArray(manifest.files) || manifest.files.length !== files.length) return;
+      manifest.files.forEach((metadata, index) => {
+        if (metadata && typeof metadata === 'object' && !('retry' in metadata)) {
+          this.inputManifest.set(files[index], metadata);
+        }
+      });
+    } catch {
+      // This is an optimization. Individual reads still authorize and report failures.
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
+  }
+
+  /**
+   * Resolves an input object's bytes, preferring the runner-local cache the
+   * control plane pushes into on backends whose sandbox cannot reach the file
+   * server (see session-inputs.ts). A cache hit is presented as the very
+   * `Response` a fetch would have produced, so name resolution, read-only
+   * protection, hashing, ownership and priming all run identically for pushed
+   * and pulled inputs — there is exactly one workspace writer.
+   */
+  private async fetchInputObject(file: TFile, signal?: AbortSignal): Promise<Response> {
+    throwIfAborted(signal);
+    const cached = await openCachedInput(
+      file.storage_session_id!,
+      file.id!,
+      file.input_cache_key,
+    );
+    if (signal?.aborted) {
+      await cached?.handle.close().catch(() => {});
+      throwIfAborted(signal);
+    }
+    if (cached) {
+      this.log.debug({ fileId: file.id }, 'Priming input from pushed cache');
+      return cachedInputResponse(cached);
+    }
+    if (!this.fileEgressBaseUrl()) {
+      /* Push-model deployment with nothing pushed for this ref: fetching would
+       * hit an unreachable (or unset) file server and surface as a confusing
+       * transport error. Say what actually went wrong. */
+      throw new Error(
+        `Input ${file.id} was not delivered to the sandbox and no file server is reachable`,
+      );
+    }
+    if (config.http_input_cache_enabled && config.egress_gateway_url) {
+      const response = await fetchCachedHttpInput({
+        metadata: () => {
+          const metadata = this.inputManifest.get(file);
+          // A version-race retry must obtain a new authorized storage version.
+          this.inputManifest.delete(file);
+          return metadata === undefined
+            ? fetch(`${this.buildDownloadUrl(file)}/metadata`, { headers: this.fileEgressHeaders(), signal })
+            : Promise.resolve(Response.json(metadata));
+        },
+        download: (version, sharedSignal) => fetch(this.buildDownloadUrl(file), {
+          headers: this.fileEgressHeaders({ 'X-CodeAPI-Input-Version': version }), signal: sharedSignal,
+        }),
+        signal, maxBytes: config.input_cache_max_bytes, maxFileBytes: config.max_file_size,
+        maxInflight: config.http_input_cache_max_inflight, maxObjects: config.http_input_cache_max_objects,
+      });
+      if (response) return response;
+    }
+    return fetch(this.buildDownloadUrl(file), {
+      headers: this.fileEgressHeaders(),
+      signal,
+    });
+  }
+
+  private inputIdentity(file: TFile): string {
+    return file.input_cache_key ?? inputCacheKey(file.storage_session_id ?? '', file.id ?? '');
   }
 
   /**
@@ -1035,7 +1524,10 @@ export class Job {
     response: Response,
     tempPath: string,
     finalPath: string,
+    identity = this.sandboxIdentity(),
+    signal?: AbortSignal,
   ): Promise<string> {
+    throwIfAborted(signal);
     const body = response.body;
     if (!body) throw new Error('Response body is null');
 
@@ -1045,25 +1537,71 @@ export class Job {
     });
     const fileStream = fs.createWriteStream(tempPath, { mode: SANDBOX_FILE_MODE });
     const reader = toNodeReadable(body);
-    await pipeline(reader, hashTransform, fileStream);
-    await fsp.rename(tempPath, finalPath);
-    await this.applySandboxFilePermissions(finalPath);
+    const abort = (): void => {
+      const error = abortReason(signal!);
+      reader.destroy(error);
+      hashTransform.destroy(error);
+      fileStream.destroy(error);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    try {
+      throwIfAborted(signal);
+      await pipeline(reader, hashTransform, fileStream);
+      throwIfAborted(signal);
+      await fsp.rename(tempPath, finalPath);
+      await this.applySandboxFilePermissions(finalPath, false, identity);
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
     return hashStream.digest('hex');
   }
 
-  async writeFile(file: TFile): Promise<void> {
-    validateFilePath(file.name, this.submissionDir);
-    const filePath = path.join(this.submissionDir, file.name);
+  async writeFile(file: TFile, context?: PrimeOperationContext): Promise<void> {
+    const operation: PrimeOperationContext = context ?? {
+      submissionDir: this.submissionDir,
+      identity: this.sandboxIdentity(),
+    };
+    throwIfAborted(operation.signal);
+    validateFilePath(file.name, operation.submissionDir);
+    const filePath = path.join(operation.submissionDir, file.name);
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
     const parentDir = path.dirname(filePath);
-    await fsp.mkdir(parentDir, { recursive: true });
-    await this.secureAncestors(parentDir);
-    await fsp.writeFile(filePath, content);
-    await this.applySandboxFilePermissions(filePath);
+    if (this.session) await this.ensureDirNoFollow(parentDir, operation.submissionDir);
+    else await fsp.mkdir(parentDir, { recursive: true });
+    await this.secureAncestors(parentDir, operation.submissionDir, operation.identity);
+    throwIfAborted(operation.signal);
+    if (this.session) {
+      /* Mirrors the by-reference prime above. A prior turn could have left a
+       * symlink (or directory) squatting this path, and writeFile would follow
+       * the link and clobber its target as root — so clear anything that is
+       * NOT a regular file (unlink never follows a link). A regular file is
+       * LEFT in place and replaced by the rename below, so a write that fails
+       * partway cannot erase the previous turn's bytes and force a
+       * recycle/restore. A fresh per-job workspace has nothing here. */
+      const existing = await fsp.lstat(filePath).catch(() => null);
+      if (existing && !existing.isFile()) {
+        await fsp.rm(filePath, { force: true, recursive: true });
+      }
+      const tempPath = path.join(operation.submissionDir, `.tmp-${nanoid()}`);
+      try {
+        await fsp.writeFile(tempPath, content, { mode: SANDBOX_FILE_MODE });
+        await fsp.rename(tempPath, filePath);
+      } catch (error) {
+        try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
+        throw error;
+      }
+    } else {
+      await fsp.writeFile(filePath, content);
+    }
+    await this.applySandboxFilePermissions(filePath, false, operation.identity);
 
     const hash = crypto.createHash('sha256').update(content).digest('hex');
     this.inputFileHashes.set(file.name, { hash, path: filePath });
+    /* Track inline source files as session inputs too (not just downloaded
+     * ones), so a later turn that switches entrypoint (e.g. main.py -> script.sh)
+     * doesn't re-surface the prior turn's source as a generated output. */
+    if (this.session) this.session.markPrimed(file.name, file.id ?? '', false, hash);
   }
 
   async safeCall(
@@ -1119,7 +1657,9 @@ export class Job {
     const codeFiles = this.files.filter(
       f => !isDirkeep(f.name) && (!f.encoding || f.encoding === 'utf8'),
     );
-    if (this.runtime.language !== 'file' && codeFiles.length === 0) {
+    /* The request gate rejects this before priming (see hasRunnableSource);
+     * this stays as the invariant for callers that build a Job directly. */
+    if (!hasRunnableSource(this.files, this.runtime.language)) {
       throw new ValidationError('files must include at least one runnable source file');
     }
     this.entryPointName = codeFiles[0]?.name;
@@ -1164,6 +1704,10 @@ export class Job {
       version: this.runtime.version.raw,
       session_id: this.outputSessionId,
       files: this.sessionFiles,
+      ...(this.deletedFiles.length > 0
+        ? { deleted_files: this.deletedFiles }
+        : {}),
+      ...(this.artifactTruncation ? { artifact_truncation: this.artifactTruncation } : {}),
     };
   }
 
@@ -1171,6 +1715,13 @@ export class Job {
     this.generatedFiles = [];
     this.sessionFiles = [];
     this.inheritedRefs = [];
+    this.presentInputFiles.clear();
+    this.deletedFiles = [];
+    this.artifactTruncation = undefined;
+    this.truncationProbeState = {
+      remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
+      remainingHashBytes: TRUNCATION_PROBE_MAX_HASH_BYTES,
+    };
 
     const inputByName = new Map<string, TFile>();
     for (const f of this.files) inputByName.set(f.name, f);
@@ -1179,6 +1730,26 @@ export class Job {
       await this.walkDir(this.submissionDir, 0, inputByName);
     } catch (error) {
       this.log.error({ err: error }, 'Error scanning submission directory');
+      this.recordArtifactTruncation('unreadable', '.');
+    }
+
+    if (this.artifactTruncation == null) {
+      const returnedNames = new Set([
+        ...this.sessionFiles.map(file => file.name),
+        ...this.inheritedRefs.map(file => file.name),
+      ]);
+      for (const file of this.files) {
+        if (
+          file.id != null &&
+          file.storage_session_id != null &&
+          this.inputFileHashes.get(file.name)?.readOnly !== true &&
+          !this.presentInputFiles.has(file.name) &&
+          !returnedNames.has(file.name)
+        ) {
+          this.deletedFiles.push(file.name);
+          this.session?.forgetPrimed(file.name);
+        }
+      }
     }
 
     /* Generated files get priority in sessionFiles; fill remaining slots up
@@ -1189,6 +1760,23 @@ export class Job {
     const remaining = Math.max(0, config.max_output_files - this.sessionFiles.length);
     if (remaining > 0 && this.inheritedRefs.length > 0) {
       this.sessionFiles.push(...this.inheritedRefs.slice(0, remaining));
+    }
+    for (const ref of this.inheritedRefs.slice(remaining)) {
+      this.recordArtifactTruncation('max_files', ref.name);
+    }
+  }
+
+  private recordArtifactTruncation(reason: ArtifactTruncationReason, relativePath: string): void {
+    this.artifactTruncation ??= {
+      code: 'artifact_truncated',
+      reasons: {},
+      skipped: [],
+      skipped_count: 0,
+    };
+    this.artifactTruncation.reasons[reason] = (this.artifactTruncation.reasons[reason] ?? 0) + 1;
+    this.artifactTruncation.skipped_count++;
+    if (this.artifactTruncation.skipped.length < MAX_REPORTED_TRUNCATED_PATHS) {
+      this.artifactTruncation.skipped.push(relativePath);
     }
   }
 
@@ -1213,6 +1801,7 @@ export class Job {
         isRegularFile = st.isFile();
       } catch (err) {
         this.log.debug({ path: relativePath, err }, 'walkDir: failed to lstat entry');
+        this.recordArtifactTruncation('unreadable', relativePath);
         return 'skip';
       }
     }
@@ -1233,7 +1822,14 @@ export class Job {
     inputByName: Map<string, TFile>,
   ): Promise<{ collected: boolean; truncated: boolean }> {
     const keepPath = path.join(relativePath, DIRKEEP);
-    if (!isValidPathShape(keepPath)) return { collected: false, truncated: false };
+    const pathShapeError = checkPathShape(keepPath);
+    if (pathShapeError) {
+      this.recordArtifactTruncation(
+        pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+        keepPath,
+      );
+      return { collected: false, truncated: true };
+    }
     const keepFullPath = path.join(fullPath, DIRKEEP);
     const inheritedKeep = inputByName.get(keepPath);
 
@@ -1261,6 +1857,7 @@ export class Job {
       return this.createDirkeepMarker(keepPath, keepFullPath);
     }
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     const id = nanoid();
@@ -1310,6 +1907,7 @@ export class Job {
     if (!keepModified || keepInfo?.readOnly === true) return this.echoInheritedKeep(keepPath, inheritedKeep);
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     const refreshedId = nanoid();
@@ -1351,6 +1949,7 @@ export class Job {
     inheritedKeep: TFile,
   ): { collected: boolean; truncated: boolean } {
     if (this.inheritedRefs.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     this.inheritedRefs.push({
@@ -1377,6 +1976,7 @@ export class Job {
     keepFullPath: string,
   ): Promise<{ collected: boolean; truncated: boolean }> {
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', keepPath);
       return { collected: false, truncated: true };
     }
     try {
@@ -1389,6 +1989,14 @@ export class Job {
     const id = nanoid();
     this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.outputSessionId });
     this.generatedFiles.push({ id, name: keepPath, path: keepFullPath });
+    /* A synthesized marker is a generated session output just like a regular
+     * file. Record its known empty-file digest so a successful upload commits
+     * it to the surfaced set; otherwise the persistent marker is re-uploaded
+     * on every later turn. */
+    if (this.session) {
+      const emptyHash = crypto.createHash('sha256').update('').digest('hex');
+      this.pendingSurfaced.set(id, { name: keepPath, signature: emptyHash });
+    }
     return { collected: true, truncated: false };
   }
 
@@ -1427,6 +2035,7 @@ export class Job {
 
     if (existingFile.id && existingFile.storage_session_id) {
       if (this.inheritedRefs.length >= config.max_output_files) {
+        this.recordArtifactTruncation('max_files', relativePath);
         return { collected: false, truncated: true };
       }
       this.inheritedRefs.push({
@@ -1482,27 +2091,90 @@ export class Job {
       /* Use lstat to stay consistent with classifyDirent's symlink filter —
        * following a symlink here would resurrect the exact escape vector
        * that the classification step already rejected. */
-      size = (await fsp.lstat(fullPath)).size;
+      const st = await fsp.lstat(fullPath);
+      size = st.size;
     } catch (err) {
       this.log.debug({ path: relativePath, err }, 'walkDir: unable to stat file');
-      return { collected: false, truncated: false, stopLoop: false };
-    }
-    if (size > this.runtime.max_file_size) {
+      this.recordArtifactTruncation('unreadable', relativePath);
       return { collected: false, truncated: false, stopLoop: false };
     }
 
     const inputFileInfo = this.inputFileHashes.get(relativePath);
     const existingFile = inputByName.get(relativePath);
-    let wasModified = false;
-
-    if (inputFileInfo) {
+    if (size > this.runtime.max_file_size) {
+      /* Only an inline entrypoint needs hashing to decide whether this is
+       * intentional request-input suppression. Every other oversized file
+       * is rejected immediately, preserving the scan's bounded I/O cost. */
+      if (!inputFileInfo || existingFile?.id != null || relativePath !== this.entryPointName) {
+        this.recordArtifactTruncation('size', relativePath);
+        return { collected: false, truncated: false, stopLoop: false };
+      }
       try {
         const currentHash = await this.computeFileHash(fullPath, true);
-        wasModified = currentHash !== inputFileInfo.hash;
-        if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
+        if (currentHash === inputFileInfo.hash) {
+          return { collected: true, truncated: false, stopLoop: false };
+        }
+      } catch (err) {
+        this.log.debug({ path: relativePath, err }, 'walkDir: failed to hash oversized entrypoint');
+      }
+      this.recordArtifactTruncation('size', relativePath);
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
+    /* Session mode output diffing + input-modification detection. Hash by
+     * CONTENT (not size+mtime): a program can rewrite a surfaced output with
+     * different bytes while preserving size+mtime (os.utime / touch -r), which a
+     * stat-only signature would wrongly suppress. Compute once per session/input
+     * file and reuse for the suppression check, wasModified, and the surfaced
+     * mark; non-session jobs still only hash their inputs. */
+    let contentHash: string | undefined;
+    if (inputFileInfo != null || this.session != null) {
+      try {
+        contentHash = await this.computeFileHash(fullPath, true);
       } catch (err) {
         this.log.debug({ path: relativePath, err }, 'walkDir: failed to hash file');
       }
+    }
+
+    /* Skip any output already surfaced with identical content. This includes a
+     * writable primed input whose original ref was re-sent after its modified
+     * bytes were surfaced: reuse populates inputFileInfo for modification
+     * detection, but must not upload the same modified bytes every turn.
+     * Fresh primes call markPrimed and clear stale surfaced lineage first. */
+    if (this.session && contentHash != null
+      && this.session.isSurfaced(relativePath, contentHash)) {
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
+    /* Skip a file primed as an input on an earlier turn that this turn didn't
+     * re-send: it has no inputFileInfo and was never surfaced as an output, so
+     * it would otherwise be echoed as a brand-new generated file on unrelated
+     * executions. Only suppress it while UNCHANGED vs the primed baseline: if
+     * the sandbox modified it since, surface the new bytes (also lets the
+     * upload-retry path recover a modified input whose earlier upload was
+     * pruned). Read-only inputs never surface modifications (dropped by
+     * contract), so always suppress those. */
+    if (this.session && inputFileInfo == null && this.session.isPrimedInput(relativePath)) {
+      const primedHash = this.session.primedHash(relativePath);
+      const unchanged = contentHash != null && primedHash != null && contentHash === primedHash;
+      if (unchanged || this.session.isPrimedReadOnly(relativePath)) {
+        return { collected: false, truncated: false, stopLoop: false };
+      }
+    }
+
+    let wasModified = false;
+    if (inputFileInfo && contentHash != null) {
+      wasModified = contentHash !== inputFileInfo.hash;
+      if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
+    }
+
+    /* The unchanged inline entrypoint is executable request input, not an
+     * output artifact. Suppress it before applying output-size reporting;
+     * downloaded inputs still flow through the size limit below, preserving
+     * the existing response-cap behavior for inherited refs. */
+    if (!wasModified && inputFileInfo && existingFile?.id == null
+      && relativePath === this.entryPointName) {
+      return { collected: true, truncated: false, stopLoop: false };
     }
 
     const echoed = this.tryEchoUnchangedInput({
@@ -1514,6 +2186,7 @@ export class Job {
     if (echoed) return { ...echoed, stopLoop: false };
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.recordArtifactTruncation('max_files', relativePath);
       return { collected: false, truncated: true, stopLoop: true };
     }
 
@@ -1528,6 +2201,12 @@ export class Job {
     }
     this.sessionFiles.push(fileData);
     this.generatedFiles.push({ id: newId, name: relativePath, path: fullPath });
+    /* Defer the surfaced-mark until the upload succeeds (flushed in
+     * uploadGeneratedFiles) — marking here would suppress the file forever if
+     * its upload later fails and the route prunes it from the response. */
+    if (this.session && contentHash != null) {
+      this.pendingSurfaced.set(newId, { name: relativePath, signature: contentHash });
+    }
     return { collected: true, truncated: false, stopLoop: false };
   }
 
@@ -1546,8 +2225,168 @@ export class Job {
     const childStatus = await this.walkDir(fullPath, parentDepth + 1, inputByName);
     if (childStatus === 'collected') return { collected: true, truncated: false };
     if (childStatus === 'skipped') return { collected: false, truncated: true };
-    if (this.isOutputCapFull()) return { collected: false, truncated: true };
     return this.handleEmptyDirectory(relativePath, fullPath, inputByName);
+  }
+
+  /** Finds the first artifact that a scan cap would hide without reading file
+   * contents. Files below a depth boundary cannot be valid primed inputs, and
+   * symlinks/unsupported files/hidden runtime directories remain intentional
+   * exclusions. An empty directory represents a reportable `.dirkeep`. */
+  private async findTruncatedArtifact(
+    dir: string,
+    inputByName: Map<string, TFile>,
+    state = this.truncationProbeState,
+    probeDepth = 0,
+    rootPath = path.relative(this.submissionDir, dir) || '.',
+    isOutputCapProbe = false,
+  ): Promise<string | undefined> {
+    /* The state is shared by every probe in this job. Once exhausted, return
+     * conservatively before opening yet another capped sibling directory. */
+    if (state.remainingEntries <= 0) return rootPath;
+    let directory: fs.Dir;
+    try {
+      directory = await fsp.opendir(dir);
+    } catch (err) {
+      const relativeDir = path.relative(this.submissionDir, dir) || '.';
+      this.log.debug({ dir, err }, 'walkDir: unable to inspect depth-capped directory');
+      this.recordArtifactTruncation('unreadable', relativeDir);
+      return undefined;
+    }
+
+    let sawVisibleEntry = false;
+    let sawVisibleNonHiddenEntry = false;
+    try {
+      for await (const entry of directory) {
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = path.relative(this.submissionDir, fullPath);
+        const kind = await this.classifyDirent(entry, fullPath, relativePath);
+        if (kind === 'file' && entry.name === PTC_HISTORY_FILENAME) {
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
+          continue;
+        }
+        sawVisibleEntry = true;
+        state.remainingEntries--;
+        if (state.remainingEntries < 0) return rootPath;
+        if (kind === 'skip') {
+          /* Ordinary walking counts symlinks/special entries as non-empty even
+           * though it does not surface them, so the probe must not invent a
+           * parent .dirkeep for that shape. */
+          sawVisibleNonHiddenEntry = true;
+          continue;
+        }
+        if (kind === 'file') {
+          sawVisibleNonHiddenEntry = true;
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
+          if (entry.name !== DIRKEEP && !isSupportedOutputFilename(entry.name)) continue;
+          const existingFile = inputByName.get(relativePath);
+          const inputFileInfo = this.inputFileHashes.get(relativePath);
+          let capProbeStat: fs.Stats | undefined;
+          if (isOutputCapProbe) {
+            const pathShapeError = checkPathShape(relativePath);
+            if (pathShapeError) {
+              this.recordArtifactTruncation(
+                pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+                relativePath,
+              );
+              continue;
+            }
+            try {
+              capProbeStat = await fsp.lstat(fullPath);
+              if (!capProbeStat.isFile()) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during cap-probe stat');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+            if (capProbeStat.size > this.runtime.max_file_size) {
+              /* Match handleRegularFile's one exception: an unchanged inline
+               * entrypoint is request input rather than an oversized output. */
+              if (!inputFileInfo || existingFile?.id != null || relativePath !== this.entryPointName) {
+                this.recordArtifactTruncation('size', relativePath);
+                continue;
+              }
+              if (capProbeStat.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat.size;
+              try {
+                if (await this.computeFileHash(fullPath, true) === inputFileInfo.hash) continue;
+              } catch (err) {
+                this.log.debug({ path: relativePath, err }, 'walkDir: failed during oversized entrypoint cap probe');
+              }
+              this.recordArtifactTruncation('size', relativePath);
+              continue;
+            }
+          }
+          if (
+            isOutputCapProbe
+            && relativePath === this.entryPointName
+            && existingFile?.id == null
+            && inputFileInfo
+          ) {
+            try {
+              if (capProbeStat!.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat!.size;
+              if (await this.computeFileHash(fullPath, true) === inputFileInfo.hash) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during entrypoint cap probe');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+          }
+          /* Once generated outputs fill the response cap, a persistent
+           * workspace may still contain unchanged artifacts from earlier
+           * turns. Ordinary walking suppresses those via their content hash,
+           * so the bounded cap probe must do the same or it reports a false
+           * max_files warning. Current-request inputs remain reportable: they
+           * would otherwise have been echoed into this response. */
+          if (isOutputCapProbe && this.session && !existingFile) {
+            if (this.session.isPrimedReadOnly(relativePath)) continue;
+            try {
+              if (capProbeStat!.size > state.remainingHashBytes) return rootPath;
+              state.remainingHashBytes -= capProbeStat!.size;
+              const hash = await this.computeFileHash(fullPath, true);
+              if (this.session.isSurfaced(relativePath, hash)) continue;
+              if (
+                this.session.isPrimedInput(relativePath)
+                && this.session.primedHash(relativePath) === hash
+              ) continue;
+            } catch (err) {
+              this.log.debug({ path: relativePath, err }, 'walkDir: failed during cap-probe hashing');
+              this.recordArtifactTruncation('unreadable', relativePath);
+              continue;
+            }
+          }
+          return relativePath;
+        }
+        if (isHiddenDirectory(entry.name) && !inputsLiveUnder(inputByName, relativePath)) continue;
+        sawVisibleNonHiddenEntry = true;
+        /* The probe exists only to avoid false warnings for small, obviously
+         * unsupported-only subtrees. Once either budget is exhausted, report
+         * the capped root conservatively instead of defeating the scan bound. */
+        if (probeDepth >= TRUNCATION_PROBE_MAX_LEVELS) return rootPath;
+        const nested = await this.findTruncatedArtifact(
+          fullPath,
+          inputByName,
+          state,
+          probeDepth + 1,
+          rootPath,
+          isOutputCapProbe,
+        );
+        if (nested) return nested;
+      }
+    } catch (err) {
+      const relativeDir = path.relative(this.submissionDir, dir) || '.';
+      this.log.debug({ dir, err }, 'walkDir: failed during bounded directory inspection');
+      this.recordArtifactTruncation('unreadable', relativeDir);
+      return undefined;
+    }
+
+    return sawVisibleEntry && sawVisibleNonHiddenEntry
+      ? undefined
+      : path.join(path.relative(this.submissionDir, dir), DIRKEEP);
   }
 
   /**
@@ -1561,14 +2400,30 @@ export class Job {
     depth: number,
     inputByName: Map<string, TFile>,
   ): Promise<'collected' | 'empty' | 'skipped'> {
-    if (depth >= config.max_nesting_depth) return 'skipped';
-    if (this.isOutputCapFull()) return 'skipped';
-
+    const relativeDir = path.relative(this.submissionDir, dir) || '.';
+    if (depth >= config.max_nesting_depth) {
+      const skippedPath = await this.findTruncatedArtifact(dir, inputByName);
+      if (skippedPath) this.recordArtifactTruncation('depth', skippedPath);
+      return 'skipped';
+    }
+    if (this.isOutputCapFull()) {
+      const skippedPath = await this.findTruncatedArtifact(
+        dir,
+        inputByName,
+        this.truncationProbeState,
+        0,
+        relativeDir,
+        true,
+      );
+      if (skippedPath) this.recordArtifactTruncation('max_files', skippedPath);
+      return 'skipped';
+    }
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
     } catch (err) {
       this.log.debug({ dir, err }, 'walkDir: unable to read directory');
+      this.recordArtifactTruncation('unreadable', relativeDir);
       return 'skipped';
     }
 
@@ -1587,7 +2442,6 @@ export class Job {
      * separate npm packages so we can't import directly; the filename literal
      * is asserted-equal in `service/scripts/test-ptc-sentinel.ts` to catch
      * accidental drift in CI. */
-    const PTC_HISTORY_FILENAME = '_ptc_history.json';
     const isPtcReserved = (name: string): boolean => name === PTC_HISTORY_FILENAME;
 
     const nonDirkeepCount = entries.reduce(
@@ -1607,15 +2461,20 @@ export class Job {
     let skippedHiddenDirs = 0;
 
     for (const entry of entries) {
-      if (this.isOutputCapFull()) { truncated = true; break; }
-      if (isPtcReserved(entry.name)) continue;
-
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);
-      if (!isValidPathShape(relativePath)) continue;
-
       const kind = await this.classifyDirent(entry, fullPath, relativePath);
       if (kind === 'skip') continue;
+
+      if (kind === 'file' && inputByName.has(relativePath)) {
+        this.presentInputFiles.add(relativePath);
+      }
+
+      /* A by-reference input may legitimately use the reserved replay-history
+       * basename on the ordinary execution endpoint. It remains hidden from
+       * output collection, but must be observed before the runtime fixture is
+       * skipped so an untouched input is not reported as deleted. */
+      if (kind === 'file' && isPtcReserved(entry.name)) continue;
 
       if (kind === 'dir') {
         /* Skip hidden directories (basename starts with `.`) unless the user
@@ -1630,9 +2489,42 @@ export class Job {
           skippedHiddenDirs++;
           continue;
         }
+        const pathShapeError = checkPathShape(relativePath);
+        if (pathShapeError) {
+          const skippedPath = await this.findTruncatedArtifact(
+            fullPath,
+            inputByName,
+            this.truncationProbeState,
+            0,
+            relativePath,
+          );
+          if (skippedPath) {
+            this.recordArtifactTruncation(
+              pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+              skippedPath,
+            );
+            truncated = true;
+          }
+          continue;
+        }
         const res = await this.walkSubdirectory(relativePath, fullPath, depth, inputByName);
         if (res.collected) hasCollectedChild = true;
         if (res.truncated) truncated = true;
+        if (this.isOutputCapFull() && this.artifactTruncation?.reasons.max_files) break;
+        continue;
+      }
+
+      /* Check intentional filename filtering before path limits. Unsupported
+       * files never belong in files[], regardless of how long their path is. */
+      if (entry.name !== DIRKEEP && !isSupportedOutputFilename(entry.name)) continue;
+
+      const pathShapeError = checkPathShape(relativePath);
+      if (pathShapeError) {
+        this.recordArtifactTruncation(
+          pathShapeError.includes('nesting depth') ? 'depth' : 'path',
+          relativePath,
+        );
+        truncated = true;
         continue;
       }
 
@@ -1694,6 +2586,15 @@ export class Job {
       if (id) uploaded.add(id);
     }
 
+    /* Commit the surfaced-mark only for files that actually uploaded, so a
+     * dropped upload leaves the file eligible to surface again next turn. */
+    if (this.session) {
+      for (const id of uploaded) {
+        const pending = this.pendingSurfaced.get(id);
+        if (pending) this.session.markSurfaced(pending.name, pending.signature);
+      }
+    }
+
     if (uploaded.size < this.generatedFiles.length) {
       this.log.warn(
         { uploaded: uploaded.size, total: this.generatedFiles.length },
@@ -1745,11 +2646,12 @@ export class Job {
     }
 
     const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.outputSessionId)}/objects/${encodeURIComponent(file.id)}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    let headers: Record<string, string>;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let uploadHandle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+    let stream: fs.ReadStream | undefined;
+    let response: Response | undefined;
     try {
-      headers = this.fileEgressHeaders({
+      const headers = this.fileEgressHeaders({
         /* file-server URL-decodes this header to recover the canonical
          * filename, so paths with `/` survive transport without colliding
          * with the `___` separators or RFC 5987 quoting rules used
@@ -1763,19 +2665,14 @@ export class Job {
         'Content-Type': mimeTypeFor(file.name),
         'Content-Length': String(size),
       });
-    } catch (error) {
-      clearTimeout(timeout);
-      this.log.error({ file: file.name, err: error }, 'Error preparing upload');
-      return null;
-    }
-
-    const stream = fs.createReadStream(file.path, { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW });
-    stream.on('error', (error) => {
-      this.log.warn({ file: file.name, err: error }, 'Upload file stream error');
-    });
-
-    let response: Response | undefined;
-    try {
+      /* See computeFileHash: numeric O_NOFOLLOW is only typed via fsp.open. */
+      uploadHandle = await fsp.open(file.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      stream = uploadHandle.createReadStream();
+      stream.on('error', (error) => {
+        this.log.warn({ file: file.name, err: error }, 'Upload file stream error');
+      });
+      const controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), 30000);
       response = await fetch(url, {
         method: 'PUT',
         headers,
@@ -1798,8 +2695,9 @@ export class Job {
       this.log.error({ file: file.name, err: error }, 'Error uploading file');
       return null;
     } finally {
-      clearTimeout(timeout);
-      stream.destroy();
+      if (timeout) clearTimeout(timeout);
+      stream?.destroy();
+      await uploadHandle?.close().catch(() => {});
       /* Drain or cancel the response body. Undici keeps the socket
        * reserved until the body is consumed; under concurrent uploads,
        * leaving bodies unread exhausts the connection pool and stalls
@@ -1818,43 +2716,88 @@ export class Job {
     if (!this.isSynthetic) {
       this.log.info('Cleaning up');
     }
-    let workspaceRemoved = true;
-    const workspaceLease = this.workspaceLease;
-    const jobIdentity = this.jobIdentity;
 
-    if (workspaceLease) {
-      try {
-        workspaceRemoved = await cleanupSandboxWorkspace(workspaceLease);
-      } catch (error) {
-        workspaceRemoved = false;
-        this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
-      } finally {
+    let outcome: 'removed' | 'preserved' | 'retained' | 'error' = 'error';
+    try {
+      /* Session mode: the workspace and pinned UID belong to the long-lived
+       * session, not this job. Keep both so the next call sees prior files;
+       * teardown happens on the /terminate hook (or explicit session reset). */
+      if (this.session) {
         this.workspaceLease = undefined;
         this.submissionDir = '';
+        this.jobIdentity = undefined;
+        outcome = 'preserved';
+        return;
       }
-    }
 
-    if (jobIdentity) {
-      if (!workspaceLease || workspaceRemoved) {
-        releaseJobIdentity(jobIdentity);
-      } else {
-        retainWorkspaceCleanupUntilRemoved(workspaceLease, () => {
-          releaseJobIdentity(jobIdentity);
-          this.log.info(
-            { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
-            'Released retained sandbox job UID slot after workspace cleanup',
-          );
-        });
-        this.log.error(
-          { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
-          'Retaining sandbox job UID slot after failed workspace cleanup',
-        );
+      let workspaceRemoved = true;
+      const workspaceLease = this.workspaceLease;
+      const jobIdentity = this.jobIdentity;
+
+      if (workspaceLease) {
+        try {
+          workspaceRemoved = await cleanupSandboxWorkspace(workspaceLease);
+        } catch (error) {
+          workspaceRemoved = false;
+          this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
+        } finally {
+          this.workspaceLease = undefined;
+          this.submissionDir = '';
+        }
       }
-      this.jobIdentity = undefined;
+
+      if (jobIdentity) {
+        if (!workspaceLease || workspaceRemoved) {
+          releaseJobIdentity(jobIdentity);
+        } else {
+          retainWorkspaceCleanupUntilRemoved(workspaceLease, () => {
+            releaseJobIdentity(jobIdentity);
+            this.log.info(
+              { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+              'Released retained sandbox job UID slot after workspace cleanup',
+            );
+          });
+          this.log.error(
+            { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+            'Retaining sandbox job UID slot after failed workspace cleanup',
+          );
+        }
+        this.jobIdentity = undefined;
+      }
+      outcome = workspaceRemoved ? 'removed' : 'retained';
+    } finally {
+      recordCleanupResources({
+        job: this.uuid,
+        mode: this.session ? 'session' : 'disposable',
+        outcome,
+        suppressSuccessLogs: this.isSynthetic,
+      });
     }
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Input priming aborted');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise(resolve => setTimeout(resolve, ms));
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    const abort = (): void => {
+      clearTimeout(timer);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
 }
