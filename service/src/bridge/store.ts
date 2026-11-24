@@ -15,14 +15,20 @@ import {
   BRIDGE_PROTOCOL_VERSION,
   isValidBridgeWorkerCapabilities,
   isValidBridgeWorkerId,
+    isWorkspaceDetachedCommandKey,
+    isWorkspaceMutationOperation,
     isWorkspaceToolRequest,
     isWorkspaceToolResult,
+    workspaceDetachedCommandKey,
     workspaceIsolationKey,
     workspaceIsolationParent,
 } from '../../../packages/code/src/protocol';
 import type { BridgeWorkerBinding } from './pairing';
-import { BridgeAdmissionQueue } from './admission';
+import logger from '../logger';
+import { hasLaneGit, laneGitPolicy } from './lane-git';
+import { BridgeAdmissionQueue, durableAdmissionFence } from './admission';
 import { BridgeWorkspaceSlots } from './slots';
+import type { StoredWorkspaceRequest } from '../workspace-tools/requests';
 
 const PREFIX = 'codeapi:bridge:v1';
 const POLL_INTERVAL_MS = 100;
@@ -90,6 +96,22 @@ interface StoredAssignment extends CodeBridgeAssignment {
   leaseTokenHash: string;
   workerIdentityId?: string;
   workspaceFence?: string;
+  durableRequestKey?: string;
+}
+
+export type DurableWorkspaceAssignment = StoredAssignment;
+
+export interface DurableWorkspaceGuard {
+  key: string;
+  claimKey: string;
+  token: string;
+}
+
+export interface DurableWorkspaceOutcome {
+  state: 'completed' | 'failed' | 'cancelled';
+  result?: WorkspaceToolResult;
+  error?: { code: string; message: string };
+  settlement?: CodeBridgeWorkspaceSettlement;
 }
 
 type AssignmentOwnership = Pick<
@@ -104,6 +126,7 @@ type AssignmentOwnership = Pick<
   | 'workerIdentityId'
   | 'expiresAt'
   | 'runtimeSessionId'
+  | 'durableRequestKey'
 >;
 
 const NATIVE_WORKSPACE_FENCE_PREFIX = 'native-workspace:';
@@ -123,6 +146,26 @@ function workspaceFenceParent(fence: string): string | undefined {
   return parent === undefined
     ? undefined
     : `${NATIVE_WORKSPACE_FENCE_PREFIX}${parent}`;
+}
+
+/** A detached command's fence belongs to its assignment alone and is never reset by an operator. */
+function isDetachedCommandFence(fence: string | undefined): boolean {
+  return (
+    fence?.startsWith(NATIVE_WORKSPACE_FENCE_PREFIX) === true &&
+    isWorkspaceDetachedCommandKey(fence.slice(NATIVE_WORKSPACE_FENCE_PREFIX.length))
+  );
+}
+
+/** Fences of the worktree a detached command runs in and of the checkout that worktree nests beneath. */
+function detachedCommandWorktreeFences(assignment: StoredAssignment): string[] {
+  const request = assignment.request as WorkspaceToolRequest;
+  const worktree = `${NATIVE_WORKSPACE_FENCE_PREFIX}${workspaceAdmissionId(
+    request.workspaceId,
+    request.workspaceInstanceId,
+    request.worktree,
+  )}`;
+  const parent = workspaceFenceParent(worktree);
+  return parent === undefined ? [worktree] : [worktree, parent];
 }
 
 function workspaceFenceReceiptKey(assignmentId: string): string {
@@ -148,9 +191,18 @@ export interface BridgeWorkerStatus {
   capabilities?: BridgeWorkerRegistration['capabilities'];
 }
 
+function isWorkspaceMutation(request: WorkspaceToolRequest): boolean {
+  return isWorkspaceMutationOperation(request.operation);
+}
+
+function isDetachedCommand(request: WorkspaceToolRequest): boolean {
+  return request.operation === 'execute_command' && request.detached === true;
+}
+
 function supportsWorkspaceTool(
   registration: RegisteredBridgeWorker,
   request: WorkspaceToolRequest,
+  detachedCommands: boolean,
 ): boolean {
   const capabilities = registration.capabilities.workspaceTools;
   const workspace = capabilities?.workspaces.find(
@@ -180,6 +232,13 @@ function supportsWorkspaceTool(
   if (request.operation === 'list_files' && request.afterPath !== undefined) {
     return capabilities?.listFileFeatures?.includes('after_path') === true;
   }
+  if (isDetachedCommand(request)) {
+    return (
+      detachedCommands &&
+      (registration.capabilities.workspaceLeaseSlots ?? 1) > 1 &&
+      capabilities.commandFeatures?.includes('detached') === true
+    );
+  }
   if (request.operation === 'write_file') {
     const mode = request.overwrite === false ? 'create' : 'replace';
     const modes = capabilities?.writeFileModes;
@@ -194,12 +253,21 @@ function supportsWorkspaceTool(
     const mode = request.edits === undefined ? 'single' : 'batch';
     const modes = capabilities?.editFileModes;
     const supportsMode = modes == null ? mode === 'single' : modes.includes(mode);
-    if (request.operation === 'preview_edit') return supportsMode;
+    const features = capabilities?.editFileFeatures ?? [];
+    const supportsMatching =
+      request.matching === undefined || features.includes('tolerant_match');
+    const supportsReplaceAll =
+      request.edits?.some((edit) => edit.replaceAll !== undefined) !== true ||
+      features.includes('replace_all');
+    if (request.operation === 'preview_edit') {
+      return supportsMode && supportsMatching && supportsReplaceAll;
+    }
     return (
       supportsMode &&
+      supportsMatching &&
+      supportsReplaceAll &&
       (request.expectedBaseSha256 === undefined ||
-        capabilities?.editFileFeatures?.includes('expected_base_sha256') ===
-          true)
+        features.includes('expected_base_sha256'))
     );
   }
   return true;
@@ -261,6 +329,17 @@ export function workspaceAdmissionId(
   worktree?: string,
 ): string {
   return workspaceIsolationKey(workspaceId, instanceId, worktree);
+}
+
+/** The key a workspace tool request is admitted and fenced under. A detached command is
+ * keyed by its own assignment, so it neither waits for nor holds its worktree. */
+export function workspaceToolAdmissionId(
+  request: WorkspaceToolRequest,
+  assignmentId: string,
+): string {
+  return isDetachedCommand(request)
+    ? workspaceDetachedCommandKey(assignmentId)
+    : workspaceAdmissionId(request.workspaceId, request.workspaceInstanceId, request.worktree);
 }
 
 function workerKey(workerId: string): string {
@@ -352,6 +431,12 @@ function assignmentKey(assignmentId: string): string {
   return `${PREFIX}:assignment:${assignmentId}`;
 }
 
+function withoutLaneGit(settlement: AnyCodeBridgeSettlement): AnyCodeBridgeSettlement {
+  if (settlement.status !== 'fulfilled') return settlement;
+  const { laneGit: _laneGit, ...result } = settlement.result as unknown as Record<string, unknown>;
+  return { ...settlement, result } as AnyCodeBridgeSettlement;
+}
+
 function settlementKey(assignmentId: string): string {
   return `${PREFIX}:assignment:${assignmentId}:settlement`;
 }
@@ -370,6 +455,12 @@ function tokenHash(token: string): string {
 
 function assignmentTtlSeconds(deadlineAtMs: number): number {
   return Math.max(1, Math.ceil((deadlineAtMs - Date.now()) / 1000) + 30);
+}
+
+function assignmentOutcomeTtlSeconds(assignment: AssignmentOwnership): number {
+  return assignment.durableRequestKey == null
+    ? assignmentTtlSeconds(Date.parse(assignment.expiresAt))
+    : 24 * 60 * 60;
 }
 
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -435,6 +526,10 @@ export class RedisBridgeStore {
     private readonly workerTtlSeconds = DEFAULT_WORKER_TTL_SECONDS,
     private readonly redisCommandTimeoutMs = DEFAULT_REDIS_COMMAND_TIMEOUT_MS,
     private readonly maxWorkspaceLeaseSlots = 1,
+    /** Accept `laneGit` on command results and offer `lane_git` at registration. Off by default. */
+    public readonly laneGitEnabled = false,
+    /** Schedule `detached` commands apart from their worktree. On by default; needs more than one slot. */
+    private readonly detachedCommandsEnabled = true,
   ) {
     if (
       !Number.isSafeInteger(maxWorkspaceLeaseSlots) ||
@@ -449,6 +544,11 @@ export class RedisBridgeStore {
 
   workspaceLeaseCapacity(requested = 1): number {
     return Math.min(this.maxWorkspaceLeaseSlots, requested);
+  }
+
+  /** Whether registration offers `detached`: one slot always stays free of detached commands. */
+  get detachedCommandsOffered(): boolean {
+    return this.detachedCommandsEnabled && this.maxWorkspaceLeaseSlots > 1;
   }
 
   private async dispatchCommand<T>(
@@ -766,6 +866,127 @@ export class RedisBridgeStore {
     }
   }
 
+  async prepareDurableWorkspaceTool(args: {
+    workerId: string; tenantId: string; requireTenantBinding: boolean;
+    request: WorkspaceToolRequest; executionTimeoutMs: number; queueWaitMs: number;
+  }): Promise<RegisteredBridgeWorker> {
+    if (!isWorkspaceToolRequest(args.request) ||
+      !Number.isSafeInteger(args.executionTimeoutMs) || args.executionTimeoutMs < 1 || args.executionTimeoutMs > 305_000 ||
+      !Number.isSafeInteger(args.queueWaitMs) || args.queueWaitMs < 1 || args.queueWaitMs > 300_000) {
+      throw new BridgeStoreError('ASSIGNMENT_INVALID', 'Invalid durable workspace request');
+    }
+    const current = await boundedCommand(this.dispatchableRegistration(args.workerId), this.redisCommandTimeoutMs, 'Durable worker registration');
+    if (current == null) throw new BridgeStoreError('WORKER_OFFLINE', 'Code environment is offline');
+    const registration = current.registration;
+    if ((args.requireTenantBinding && registration.binding == null) ||
+      (registration.binding != null && registration.binding.tenantId !== args.tenantId)) {
+      throw new BridgeStoreError('WORKER_UNAUTHORIZED', 'Code environment is not authorized for this tenant');
+    }
+    if ((registration.capabilities.workspaceLeaseSlots ?? 1) > this.maxWorkspaceLeaseSlots ||
+      !supportsWorkspaceTool(registration, args.request, this.detachedCommandsOffered)) {
+      throw new BridgeStoreError('WORKER_MISMATCH', 'Code environment does not support the requested workspace operation');
+    }
+    return registration;
+  }
+
+  async advanceDurableWorkspaceTool(
+    record: StoredWorkspaceRequest,
+    guard: DurableWorkspaceGuard,
+  ): Promise<DurableWorkspaceOutcome | undefined> {
+    if (record.state === 'queued') {
+      if (record.cancelRequested === true) return { state: 'cancelled' };
+      if (Date.now() >= record.queueDeadlineAtMs) return {
+        state: 'failed', error: { code: 'WORKSPACE_QUEUE_TIMEOUT', message: 'Workspace admission deadline expired. The operation was not started.' },
+      };
+      const registration = await this.prepareDurableWorkspaceTool({
+        ...record, queueWaitMs: Math.max(1, record.queueDeadlineAtMs - Date.now()),
+      });
+      if (registration.incarnationId !== record.registration.incarnationId ||
+        registration.identityId !== record.registration.identityId ||
+        registration.binding?.tenantId !== record.registration.binding?.tenantId) {
+        throw new BridgeStoreError('WORKER_FENCED', 'Code environment changed while the request was waiting');
+      }
+      const admission = new BridgeAdmissionQueue(this.redis);
+      const workspace = workspaceToolAdmissionId(record.request, record.id);
+      const capacity = registration.capabilities.workspaceLeaseSlots ?? 1;
+      if (capacity === 1 && !await admission.isHead(record.workerId, record.id)) return;
+      const expiresAtMs = Date.now() + record.executionTimeoutMs;
+      const ttlSeconds = assignmentTtlSeconds(expiresAtMs);
+      let slot: number | undefined;
+      if (capacity > 1) {
+        slot = await new BridgeWorkspaceSlots(this.redis).reserve({
+          workerId: record.workerId, incarnationId: registration.incarnationId,
+          assignmentId: record.id, workspaceId: workspace, capacity,
+          expiresAtMs: Date.now() + ttlSeconds * 1000, refreshOwned: true, guard,
+        });
+        if (slot === undefined) return;
+      } else if (!await this.acquireLock(record.workerId, record.id, registration.incarnationId, ttlSeconds, true, guard)) return;
+      if (Date.now() >= record.queueDeadlineAtMs) return {
+        state: 'failed', error: { code: 'WORKSPACE_QUEUE_TIMEOUT', message: 'Workspace admission deadline expired. The operation was not started.' },
+      };
+      const leaseToken = randomBytes(32).toString('base64url');
+      const assignment: StoredAssignment = {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        assignmentId: record.id, workerId: record.workerId,
+        incarnationId: registration.incarnationId,
+        generation: await this.redis.incr(generationKey(record.workerId)),
+        leaseToken, leaseTokenHash: tokenHash(leaseToken),
+        workerIdentityId: registration.identityId,
+        workspaceFence: `${NATIVE_WORKSPACE_FENCE_PREFIX}${workspace}`,
+        workspaceLeaseSlot: slot, executionKind: 'workspace_tool', durableRequestKey: record.key,
+        expiresAt: new Date(Date.now() + record.executionTimeoutMs).toISOString(),
+        request: record.request,
+      };
+      const ready = await this.dispatchableRegistration(record.workerId);
+      if (ready == null) throw new BridgeStoreError('WORKER_OFFLINE', 'Code environment is temporarily unavailable');
+      if (ready.registration.incarnationId !== registration.incarnationId ||
+        ready.registration.identityId !== registration.identityId ||
+        ready.registration.binding?.tenantId !== registration.binding?.tenantId ||
+        !supportsWorkspaceTool(ready.registration, record.request, this.detachedCommandsOffered)) {
+        throw new BridgeStoreError('WORKER_FENCED', 'Code environment changed before admission');
+      }
+      await this.enqueueForActiveIncarnation(assignment, assignmentTtlSeconds(Date.parse(assignment.expiresAt)), ready.readyToken, guard);
+      return;
+    }
+    const assignment = record.assignment;
+    if (assignment == null) throw new Error('Durable admitted request has no assignment');
+    let settlement: CodeBridgeWorkspaceSettlement;
+    try {
+      const raw = await boundedCommand(this.redis.get(settlementKey(record.id)), this.redisCommandTimeoutMs, 'Durable settlement lookup');
+      if (raw == null && record.cancelRequested !== true && Date.now() < Date.parse(assignment.expiresAt)) return;
+      if (raw != null) settlement = JSON.parse(raw) as CodeBridgeWorkspaceSettlement;
+      else {
+        const controller = new AbortController();
+        if (record.cancelRequested === true) controller.abort();
+        settlement = await this.waitForSettlement(assignment, Date.parse(assignment.expiresAt), controller.signal) as unknown as CodeBridgeWorkspaceSettlement;
+      }
+    } catch (error) {
+      if (!(error instanceof BridgeStoreError) || error.code !== 'ASSIGNMENT_EXPIRED') throw error;
+      if (record.cancelRequested === true && !isWorkspaceMutation(record.request)) return { state: 'cancelled' };
+      return { state: 'failed', error: { code: error.code, message: 'Assignment ended without a confirmed result. Do not replay this operation.' } };
+    }
+    if (settlement.status === 'fulfilled') {
+      if (!isWorkspaceToolResult(record.request, settlement.result, record.registration.capabilities.workspaceTools)) {
+        return { state: 'failed', error: { code: 'RESULT_INVALID', message: 'Code environment returned an invalid workspace result. Do not replay this operation.' } };
+      }
+      return { state: 'completed', result: settlement.result, settlement };
+    }
+    return {
+      state: record.cancelRequested === true ? 'cancelled' : 'failed',
+      error: { code: settlement.errorCode ?? 'WORKSPACE_TOOL_REJECTED', message: settlement.error }, settlement,
+    };
+  }
+
+  async finishDurableWorkspaceTool(record: StoredWorkspaceRequest): Promise<void> {
+    if (record.assignment != null) {
+      if (record.settlement != null) await this.commitPendingWorkspace(record.assignment, record.settlement, record.key);
+      await this.cleanupDispatch(record.workerId, record.id, record.assignment);
+    } else {
+      await this.cleanupUnassignedSlot(record.workerId, record.registration.incarnationId, record.id);
+    }
+    await new BridgeAdmissionQueue(this.redis).leave(record.workerId, record.id);
+  }
+
   async dispatchWorkspaceTool(args: {
     workerId: string;
     tenantId?: string;
@@ -890,7 +1111,7 @@ export class RedisBridgeStore {
     }
     if (
       args.workspaceRequest != null &&
-      !supportsWorkspaceTool(registration, args.workspaceRequest)
+      !supportsWorkspaceTool(registration, args.workspaceRequest, this.detachedCommandsOffered)
     ) {
       throw new BridgeStoreError(
         'WORKER_MISMATCH',
@@ -944,14 +1165,16 @@ export class RedisBridgeStore {
       args.workspaceRequest?.workspaceInstanceId ?? workspaceInstanceId(args.body);
     const selectedWorktree =
       args.workspaceRequest?.worktree ?? workspaceWorktree(args.body);
-    const selectedWorkspaceAdmissionId =
-      selectedWorkspaceId == null
-        ? undefined
-        : workspaceAdmissionId(
-            selectedWorkspaceId,
-            selectedWorkspaceInstanceId,
-            selectedWorktree,
-          );
+    let selectedWorkspaceAdmissionId: string | undefined;
+    if (args.workspaceRequest != null) {
+      selectedWorkspaceAdmissionId = workspaceToolAdmissionId(args.workspaceRequest, assignmentId);
+    } else if (selectedWorkspaceId != null) {
+      selectedWorkspaceAdmissionId = workspaceAdmissionId(
+        selectedWorkspaceId,
+        selectedWorkspaceInstanceId,
+        selectedWorktree,
+      );
+    }
     const workspaceSlots =
       selectedWorkspaceId != null &&
       (registration.capabilities.workspaceLeaseSlots ?? 1) > 1
@@ -1072,7 +1295,11 @@ export class RedisBridgeStore {
         }
         if (
           (args.workspaceRequest != null &&
-            !supportsWorkspaceTool(current.registration, args.workspaceRequest)) ||
+            !supportsWorkspaceTool(
+              current.registration,
+              args.workspaceRequest,
+              this.detachedCommandsOffered,
+            )) ||
           (args.workspaceId != null &&
             !supportsWorkspaceProgrammatic(
               current.registration,
@@ -1188,6 +1415,7 @@ export class RedisBridgeStore {
           !supportsWorkspaceTool(
             replacement.registration,
             args.workspaceRequest,
+            this.detachedCommandsOffered,
           )
         ) {
           throw new BridgeStoreError(
@@ -1239,12 +1467,17 @@ export class RedisBridgeStore {
           await boundedCommand(this.redis.eval(
             [
               "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
-              "redis.call('SET', KEYS[1], 'quarantined:' .. ARGV[1])",
+              "if ARGV[2] ~= '' then",
+              "  redis.call('SET', KEYS[1], 'quarantined:' .. ARGV[1], 'EX', ARGV[2])",
+              'else',
+              "  redis.call('SET', KEYS[1], 'quarantined:' .. ARGV[1])",
+              'end',
               'return 1',
             ].join('\n'),
             1,
             workspaceQuarantineKey(args.workerId, assignment.workspaceFence),
             assignment.assignmentId,
+            this.detachedFenceTtlSeconds(assignment),
           ), this.redisCommandTimeoutMs, 'Bridge native workspace finalization quarantine');
         } else if (assignmentWorkspace(assignment) !== undefined) {
           await this.quarantine(
@@ -1405,6 +1638,7 @@ export class RedisBridgeStore {
           leaseTokenHash: _leaseTokenHash,
           workerIdentityId: _workerIdentityId,
           workspaceFence: _workspaceFence,
+          durableRequestKey: _durableRequestKey,
           ...wireAssignment
         } = assignment;
         return {
@@ -1632,12 +1866,25 @@ export class RedisBridgeStore {
       );
       return;
     }
-    const serializedSettlement = JSON.stringify(settlement);
+    let serializedSettlement = JSON.stringify(settlement);
     const existingSettlement = await this.leaseCommand(
       this.redis.get(settlementKey(assignmentId)),
       signal,
       'Bridge settlement existing read',
     );
+    if (
+      existingSettlement != null &&
+      existingSettlement !== serializedSettlement &&
+      hasLaneGit(settlement.status === 'fulfilled' ? settlement.result : undefined)
+    ) {
+      // A retry of a committed settlement must stay recognizable whichever way this replica's
+      // lane Git setting differs from the replica that committed it.
+      const stripped = withoutLaneGit(settlement);
+      if (existingSettlement === JSON.stringify(stripped)) {
+        settlement = stripped;
+        serializedSettlement = existingSettlement;
+      }
+    }
     if (
       existingSettlement != null &&
       existingSettlement !== serializedSettlement
@@ -1697,7 +1944,14 @@ export class RedisBridgeStore {
         'Bridge assignment has expired',
       );
     }
-    const ttlSeconds = assignmentTtlSeconds(Date.parse(assignment.expiresAt));
+    // Uses the assignment and registration already read above: no extra round trips on the
+    // settlement path, which has only a short grace after the command ran.
+    const sanitized = this.sanitizeLaneGit(assignmentId, settlement, assignment, registration);
+    if (sanitized !== settlement) {
+      settlement = sanitized;
+      serializedSettlement = JSON.stringify(settlement);
+    }
+    const ttlSeconds = assignmentOutcomeTtlSeconds(assignment);
     const settlementKeys = [
       assignmentKey(assignmentId),
       settlementKey(assignmentId),
@@ -1799,10 +2053,42 @@ export class RedisBridgeStore {
       settlement.status === 'rejected'
     ) {
       // The dispatcher may already have timed out and finished its cleanup.
-      // Release only this settled reservation, retaining a quarantine marker.
+      // Release this settled reservation and its fence; a quarantine marker stays.
       await this.commitPendingWorkspace(assignment, settlement);
       await this.cleanupWithRetry(workerId, assignmentId, assignment);
     }
+  }
+
+  /**
+   * Validate the optional `laneGit` of a fulfilled execute_command settlement before it is
+   * stored or forwarded. An invalid, unexpected or unadvertised value is dropped, never an
+   * error: the command's own result must still reach the caller. Pure over records the caller
+   * already read, so it adds no Redis round trips.
+   */
+  private sanitizeLaneGit(
+    assignmentId: string,
+    settlement: AnyCodeBridgeSettlement,
+    assignment: StoredAssignment,
+    registration: RegisteredBridgeWorker | undefined,
+  ): AnyCodeBridgeSettlement {
+    if (
+      settlement.status !== 'fulfilled' ||
+      !hasLaneGit(settlement.result) ||
+      assignment.executionKind !== 'workspace_tool' ||
+      (assignment.request as WorkspaceToolRequest).operation !== 'execute_command'
+    ) {
+      return settlement;
+    }
+    const { dropped } = laneGitPolicy({
+      result: settlement.result as unknown as Record<string, unknown>,
+      enabled: this.laneGitEnabled,
+      advertised:
+        registration?.capabilities.workspaceTools?.commandResultFeatures?.includes('lane_git') === true,
+    });
+    if (dropped === undefined) return settlement;
+    // Reason only: never the branch, the head or anything else from the result.
+    logger.debug('Dropped lane Git from a command settlement', { reason: dropped, assignmentId });
+    return withoutLaneGit(settlement);
   }
 
   async cancelled(
@@ -1940,7 +2226,11 @@ export class RedisBridgeStore {
             // A completed cleanup receipt is terminal: a lost response must
             // not let a late quarantine overwrite a newer root owner.
             "  if redis.call('HGET', KEYS[1], 'localCleanup') == '1' and redis.call('HGET', KEYS[1], 'resultCommitted') == '1' then return 1 end",
-            "  redis.call('SET', KEYS[5], 'quarantined:' .. ARGV[5])",
+            "  if ARGV[9] ~= '' then",
+            "    redis.call('SET', KEYS[5], 'quarantined:' .. ARGV[5], 'EX', ARGV[9])",
+            '  else',
+            "    redis.call('SET', KEYS[5], 'quarantined:' .. ARGV[5])",
+            '  end',
             // Never replace a committed result. Before settlement, terminate the waiter.
             "  redis.call('SET', KEYS[6], ARGV[6], 'EX', ARGV[7], 'NX')",
             'else',
@@ -1976,8 +2266,9 @@ export class RedisBridgeStore {
           raw.epoch,
           assignmentId,
           JSON.stringify(settlement),
-          assignmentTtlSeconds(Date.parse(receipt.expiresAt)),
+          assignmentOutcomeTtlSeconds(receipt),
           quarantine ? '1' : '0',
+          this.detachedFenceTtlSeconds(receipt),
         ),
         signal,
         'Workspace quarantine fence commit',
@@ -2121,14 +2412,12 @@ export class RedisBridgeStore {
     const cancelledMutation =
       signal.aborted &&
       (assignment.executionKind === 'workspace_programmatic' ||
-        (workspaceRequest != null &&
-          (workspaceRequest.operation === 'write_file' ||
-            workspaceRequest.operation === 'edit_file' ||
-            workspaceRequest.operation === 'execute_command')));
-    if (cancelledMutation) {
+        (workspaceRequest != null && isWorkspaceMutation(workspaceRequest)));
+    const cancelledDurableWorkspace = signal.aborted && assignment.durableRequestKey != null && workspaceRequest != null;
+    if (cancelledMutation || cancelledDurableWorkspace) {
       try {
         // Keep the acknowledged assignment available long enough for the
-        // worker to terminate its process tree and commit a clean rejection.
+        // worker to stop its operation and commit a clean rejection.
         // Closing it first makes that rejection impossible to acknowledge and
         // leaves the worker's durable mutation guard armed.
         await this.cancel(assignment.assignmentId, assignment);
@@ -2209,6 +2498,13 @@ export class RedisBridgeStore {
     );
   }
 
+  /** Expiry of a detached command's fence or quarantine receipt; empty for a worktree fence, which never expires. */
+  private detachedFenceTtlSeconds(assignment: AssignmentOwnership): string {
+    return isDetachedCommandFence(assignment.workspaceFence)
+      ? String(assignmentOutcomeTtlSeconds(assignment))
+      : '';
+  }
+
   private async cancel(
     assignmentId: string,
     assignment?: AssignmentOwnership,
@@ -2228,17 +2524,35 @@ export class RedisBridgeStore {
     assignment: StoredAssignment,
     ttlSeconds: number,
     readyToken?: string,
+    guard?: DurableWorkspaceGuard,
   ): Promise<boolean> {
     const script = [
+      'local keyCount = tonumber(ARGV[10])',
+      ...(guard == null ? [] : [
+        ...durableAdmissionFence('KEYS[keyCount + 1]', 'KEYS[keyCount + 2]', 'ARGV[11]', -2),
+        ...(assignment.workspaceLeaseSlot === undefined
+          ? ['if redis.call(\'GET\', KEYS[keyCount + 3]) ~= ARGV[4] or redis.call(\'GET\', KEYS[4]) ~= ARGV[1] then return -2 end']
+          : [
+            `if redis.call('HGET', KEYS[keyCount + 3], 'a:${assignment.workspaceLeaseSlot}') ~= ARGV[4] then return -2 end`,
+            `if redis.call('HGET', KEYS[keyCount + 3], 'i:${assignment.workspaceLeaseSlot}') ~= ARGV[1] then return -2 end`,
+          ]),
+      ]),
       "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
       'if ARGV[7] ~= "" and redis.call(\'GET\', KEYS[6]) ~= ARGV[7] then return 0 end',
-      "if #KEYS >= 7 and redis.call('EXISTS', KEYS[7]) == 1 then return -1 end",
+      'if keyCount >= 7 and redis.call(\'EXISTS\', KEYS[7]) == 1 then return -1 end',
+      // A detached command holds no worktree, but still refuses a quarantined one.
+      "if ARGV[9] == 'detached' then",
+      '  for i = 10, keyCount do',
+      "    local held = redis.call('GET', KEYS[i])",
+      "    if held and string.sub(held, 1, 12) == 'quarantined:' then return -1 end",
+      '  end',
+      'end',
       // A lane refuses a quarantined checkout. A checkout reaches enqueue only once no
       // lane beneath it holds a slot, so any lane fence still indexed here is stuck.
       "if ARGV[9] == 'lane' and redis.call('EXISTS', KEYS[10]) == 1 then return -1 end",
       "if ARGV[9] == 'checkout' then",
-      "  for i = 11, #KEYS do if redis.call('EXISTS', KEYS[i]) == 1 then return -1 end end",
-      "  for i = 11, #KEYS do redis.call('SREM', KEYS[10], KEYS[i]) end",
+      '  for i = 11, keyCount do if redis.call(\'EXISTS\', KEYS[i]) == 1 then return -1 end end',
+      '  for i = 11, keyCount do redis.call(\'SREM\', KEYS[10], KEYS[i]) end',
       'end',
       'redis.call(\'SET\', KEYS[2], ARGV[2], \"EX\", ARGV[3])',
       "redis.call('RPUSH', KEYS[3], ARGV[4])",
@@ -2247,15 +2561,27 @@ export class RedisBridgeStore {
         ? ['redis.call(\'SET\', KEYS[4], ARGV[1], \"PX\", ARGV[5])']
         : []),
       'redis.call(\'SET\', KEYS[5], "1", \"PXAT\", ARGV[6])',
-      "if #KEYS >= 7 then redis.call('SET', KEYS[7], ARGV[4]) end",
-      "if ARGV[9] == 'lane' then redis.call('SADD', KEYS[11], KEYS[7]) end",
-      'if #KEYS >= 9 then',
-      "  local epoch = redis.call('GET', KEYS[9])",
-      "  if type(epoch) ~= 'string' then epoch = '0'; redis.call('SET', KEYS[9], epoch, 'EX', ARGV[3]) end",
-      "  if redis.call('PTTL', KEYS[9]) < tonumber(ARGV[3]) * 1000 then redis.call('EXPIRE', KEYS[9], ARGV[3]) end",
-      "  redis.call('HSET', KEYS[8], 'metadata', ARGV[8], 'epoch', epoch)",
-      "  redis.call('EXPIRE', KEYS[8], ARGV[3])",
+      'if keyCount >= 7 then',
+      // Nobody resets a detached command's fence, so it expires with the assignment outcome.
+      "  if ARGV[13] ~= '' then",
+      "    redis.call('SET', KEYS[7], ARGV[4], 'EX', ARGV[13])",
+      '  else',
+      "    redis.call('SET', KEYS[7], ARGV[4])",
+      '  end',
       'end',
+      "if ARGV[9] == 'lane' then redis.call('SADD', KEYS[11], KEYS[7]) end",
+      'if keyCount >= 9 then',
+      // A successor invalidates every older receipt, even if its predecessor
+      // rejected before cleanup and the successor later releases its fence.
+      "  redis.call('INCR', KEYS[9])",
+      "  local epoch = redis.call('GET', KEYS[9])",
+      '  if redis.call(\'PTTL\', KEYS[9]) < tonumber(ARGV[12]) * 1000 then redis.call(\'EXPIRE\', KEYS[9], ARGV[12]) end',
+      "  redis.call('HSET', KEYS[8], 'metadata', ARGV[8], 'epoch', epoch)",
+      '  redis.call(\'EXPIRE\', KEYS[8], ARGV[12])',
+      'end',
+      ...(guard == null ? [] : [
+        'redis.call(\'HSET\', KEYS[keyCount + 1], \'state\', \'admitted\', \'assignment\', ARGV[2], \'admittedAtMs\', admissionNowMs)',
+      ]),
       'return 1',
     ].join('\n');
     const keys = [
@@ -2288,15 +2614,23 @@ export class RedisBridgeStore {
       leaseTokenHash: assignment.leaseTokenHash,
       workerIdentityId: assignment.workerIdentityId,
       expiresAt: assignment.expiresAt,
+      durableRequestKey: assignment.durableRequestKey,
     };
-    let fenceScope: '' | 'lane' | 'checkout' = '';
+    let fenceScope: '' | 'lane' | 'checkout' | 'detached' = '';
     if (assignment.workspaceLeaseSlot !== undefined) {
       keys.push(
         workspaceFenceReceiptKey(assignment.assignmentId),
         `${workspaceQuarantineKey(assignment.workerId, assignment.workspaceFence!)}:epoch`,
       );
       const parent = workspaceFenceParent(assignment.workspaceFence!);
-      if (parent !== undefined) {
+      if (isDetachedCommandFence(assignment.workspaceFence)) {
+        keys.push(
+          ...detachedCommandWorktreeFences(assignment).map((fence) =>
+            workspaceQuarantineKey(assignment.workerId, fence),
+          ),
+        );
+        fenceScope = 'detached';
+      } else if (parent !== undefined) {
         const parentFence = workspaceQuarantineKey(assignment.workerId, parent);
         keys.push(parentFence, workspaceLaneFenceIndexKey(parentFence));
         fenceScope = 'lane';
@@ -2313,6 +2647,10 @@ export class RedisBridgeStore {
         fenceScope = 'checkout';
       }
     }
+    const keyCount = keys.length;
+    if (guard != null) keys.push(guard.key, guard.claimKey,
+      assignment.workspaceLeaseSlot === undefined ? lockKey(assignment.workerId)
+        : `${workerKey(assignment.workerId)}:workspace-slots`);
     const result = await this.redis.eval(
       script,
       keys.length,
@@ -2326,6 +2664,10 @@ export class RedisBridgeStore {
       readyToken ?? '',
       JSON.stringify(receipt),
       fenceScope,
+      keyCount,
+      guard?.token ?? '',
+      guard == null ? ttlSeconds : assignmentOutcomeTtlSeconds(assignment),
+      this.detachedFenceTtlSeconds(assignment),
     );
     if (Number(result) === -1) {
       throw new BridgeStoreError(
@@ -2341,21 +2683,31 @@ export class RedisBridgeStore {
     assignmentId: string,
     incarnationId: string,
     ttlSeconds: number,
+    reuseOwned = false,
+    guard?: DurableWorkspaceGuard,
   ): Promise<boolean> {
     const script = [
+      ...(guard == null ? [] : [
+        ...durableAdmissionFence('KEYS[3]', 'KEYS[4]', 'ARGV[5]', 0),
+        'if redis.call(\'GET\', KEYS[5]) ~= ARGV[2] then return 0 end',
+      ]),
+      'if ARGV[4] == \'1\' and redis.call(\'GET\', KEYS[1]) == ARGV[1] and redis.call(\'GET\', KEYS[2]) == ARGV[2] then redis.call(\'PEXPIRE\', KEYS[1], ARGV[3]); redis.call(\'PEXPIRE\', KEYS[2], ARGV[3]); return 1 end',
       'if redis.call(\'EXISTS\', KEYS[1]) == 1 then return 0 end',
       'redis.call(\'SET\', KEYS[1], ARGV[1], \"PX\", ARGV[3])',
       'redis.call(\'SET\', KEYS[2], ARGV[2], \"PX\", ARGV[3])',
       'return 1',
     ].join('\n');
+    const keys = [lockKey(workerId), lockIncarnationKey(workerId)];
+    if (guard != null) keys.push(guard.key, guard.claimKey, workerIncarnationKey(workerId));
     const result = await this.redis.eval(
       script,
-      2,
-      lockKey(workerId),
-      lockIncarnationKey(workerId),
+      keys.length,
+      ...keys,
       assignmentId,
       incarnationId,
       String(ttlSeconds * 1000),
+      reuseOwned ? '1' : '0',
+      guard?.token ?? '',
     );
     return Number(result) === 1;
   }
@@ -2403,6 +2755,7 @@ export class RedisBridgeStore {
   private async commitPendingWorkspace(
     assignment: StoredAssignment,
     settlement: AnyCodeBridgeSettlement,
+    durableKey?: string,
   ): Promise<void> {
     if (assignment.workspaceLeaseSlot !== undefined) {
       const committed = Number(
@@ -2411,7 +2764,10 @@ export class RedisBridgeStore {
             [
               "if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end",
               "redis.call('HSET', KEYS[2], 'resultCommitted', '1')",
-              "if redis.call('HGET', KEYS[2], 'localCleanup') == '1' and redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end",
+              // A worker rejects only work that left the root unchanged, so its fence need not
+              // wait for a cleanup acknowledgement that a stopping worker may never deliver.
+              // A quarantine receipt has already replaced the fence and is never released here.
+              "if (ARGV[2] == 'rejected' or redis.call('HGET', KEYS[2], 'localCleanup') == '1') and redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end",
               'return 1',
             ].join('\n'),
             2,
@@ -2421,6 +2777,7 @@ export class RedisBridgeStore {
             ),
             workspaceFenceReceiptKey(assignment.assignmentId),
             assignment.assignmentId,
+            settlement.status,
           ),
           this.redisCommandTimeoutMs,
           'Bridge native workspace result commit',
@@ -2441,8 +2798,17 @@ export class RedisBridgeStore {
     }
     const runtimeSessionId = assignmentWorkspace(assignment)!;
     const script = [
+      ...(durableKey == null ? [] : [
+        'if redis.call(\'EXISTS\', KEYS[2]) == 1 then return 1 end',
+      ]),
       "if redis.call('GET', KEYS[1]) == ARGV[1] then",
-      "  return redis.call('DEL', KEYS[1])",
+      ...(durableKey == null
+        ? ['  return redis.call(\'DEL\', KEYS[1])']
+        : [
+          '  redis.call(\'DEL\', KEYS[1])',
+          '  redis.call(\'SET\', KEYS[2], \'1\', \'PX\', 86400000)',
+          '  return 1',
+        ]),
       'end',
       'return 0',
     ].join('\n');
@@ -2450,8 +2816,9 @@ export class RedisBridgeStore {
       await boundedCommand(
         this.redis.eval(
           script,
-          1,
+          durableKey == null ? 1 : 2,
           workspaceQuarantineKey(assignment.workerId, runtimeSessionId),
+          ...(durableKey == null ? [] : [`${durableKey}:committed:${assignment.assignmentId}`]),
           assignment.assignmentId,
         ),
         // Once settlement wins, caller cancellation must not prevent its

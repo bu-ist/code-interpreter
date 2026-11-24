@@ -3,13 +3,15 @@ import { env } from '../config';
 import { RedisBridgePairingStore } from './pairing';
 import { createBridgeRouter } from './router';
 import { RedisBridgeStore } from './store';
-import { isBridgeEnabled } from './enabled';
+import { isBridgeEnabled, isWorkspaceImportEnabled } from './enabled';
 
 export const bridgeStore = new RedisBridgeStore(
   connection,
   undefined,
   undefined,
   env.BRIDGE_MAX_WORKSPACE_LEASE_SLOTS,
+  env.BRIDGE_LANE_GIT,
+  env.BRIDGE_DETACHED_COMMANDS,
 );
 export const bridgePairings = new RedisBridgePairingStore(
   connection,
@@ -38,4 +40,5 @@ export default createBridgeRouter({
   configuredWorkerId: env.BRIDGE_WORKER_ID,
   allowDynamicWorkers: env.BRIDGE_DYNAMIC_WORKERS,
   maxCommandTimeoutMs: env.JOB_TIMEOUT,
+  workspaceImportFile: isWorkspaceImportEnabled(),
 });

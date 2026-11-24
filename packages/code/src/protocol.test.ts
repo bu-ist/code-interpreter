@@ -8,8 +8,12 @@ import {
   isSupportedBridgeArtifactName,
   isValidBridgeWorkerCapabilities,
   isValidBridgeWorkerId,
+  isWorkspaceToolErrorCode,
   isWorkspaceToolRequest,
   isWorkspaceToolResult,
+  isWorkspaceDetachedCommandKey,
+  WORKSPACE_TOOL_ERROR_CODE_FALLBACKS,
+  workspaceDetachedCommandKey,
   workspaceIsolationKey,
   workspaceIsolationKeysConflict,
   workspaceIsolationParent,
@@ -18,6 +22,17 @@ import type {
   WorkspaceEditFileRequest,
   WorkspacePreviewEditRequest,
 } from './protocol.js';
+
+test('every added workspace error code falls back to a legacy code', () => {
+  assert.equal(isWorkspaceToolErrorCode('NOT_FOUND'), true);
+  assert.equal(isWorkspaceToolErrorCode('MISSING'), false);
+  for (const [code, legacy] of Object.entries(WORKSPACE_TOOL_ERROR_CODE_FALLBACKS)) {
+    assert.equal(isWorkspaceToolErrorCode(code), true);
+    assert.equal(isWorkspaceToolErrorCode(legacy), true);
+    assert.equal(legacy in WORKSPACE_TOOL_ERROR_CODE_FALLBACKS, false);
+  }
+  assert.equal(WORKSPACE_TOOL_ERROR_CODE_FALLBACKS.NOT_FOUND, 'INVALID_PATH');
+});
 
 test('accepts gateway directory markers as artifacts', () => {
   assert.equal(isSupportedBridgeArtifactName('.dirkeep'), true);
@@ -545,6 +560,164 @@ test('workspace mutations accept bounded UTF-8 requests and exact result shapes'
   );
 });
 
+test('edit matching and replaceAll are opt-in and reported only when requested', () => {
+  const tolerant = {
+    protocolVersion: 1 as const,
+    operation: 'edit_file' as const,
+    workspaceId: 'primary',
+    path: 'notes.txt',
+    matching: 'tolerant' as const,
+    edits: [
+      { oldText: 'hello', newText: 'goodbye' },
+      { oldText: 'world', newText: 'BYOM', replaceAll: true },
+    ],
+  };
+  const result = {
+    protocolVersion: 1,
+    operation: 'edit_file',
+    workspaceId: 'primary',
+    path: 'notes.txt',
+    replacements: 2,
+    bytesWritten: 12,
+  };
+  const matches = [
+    { strategy: 'line-trimmed', occurrences: 1 },
+    { strategy: 'exact', occurrences: 3 },
+  ];
+  assert.equal(isWorkspaceToolRequest(tolerant), true);
+  assert.equal(isWorkspaceToolRequest({ ...tolerant, operation: 'preview_edit' }), true);
+  assert.equal(isWorkspaceToolRequest({ ...tolerant, matching: 'fuzzy' }), false);
+  assert.equal(
+    isWorkspaceToolRequest({
+      ...tolerant,
+      edits: [{ oldText: 'a', newText: 'b', replaceAll: 'yes' }],
+    }),
+    false,
+  );
+  assert.equal(
+    isWorkspaceToolRequest({
+      protocolVersion: 1,
+      operation: 'edit_file',
+      workspaceId: 'primary',
+      path: 'notes.txt',
+      oldText: 'a',
+      newText: 'b',
+      replaceAll: true,
+    }),
+    false,
+    'replaceAll is only accepted per batch edit',
+  );
+
+  assert.equal(isWorkspaceToolResult(tolerant, { ...result, matches }), true);
+  assert.equal(isWorkspaceToolResult(tolerant, result), false, 'an opted-in request must report matches');
+  assert.equal(
+    isWorkspaceToolResult(tolerant, { ...result, matches: matches.slice(0, 1) }),
+    false,
+  );
+  assert.equal(
+    isWorkspaceToolResult(tolerant, {
+      ...result,
+      matches: [matches[0], { strategy: 'exact', occurrences: 0 }],
+    }),
+    false,
+  );
+  assert.equal(
+    isWorkspaceToolResult(tolerant, {
+      ...result,
+      matches: [{ strategy: 'exact', occurrences: 2 }, matches[1]],
+    }),
+    false,
+    'only replaceAll edits may replace more than one location',
+  );
+
+  const exactReplaceAll = {
+    ...tolerant,
+    matching: undefined,
+    edits: [{ oldText: 'a', newText: 'b', replaceAll: true }],
+  };
+  delete exactReplaceAll.matching;
+  assert.equal(
+    isWorkspaceToolResult(exactReplaceAll, {
+      ...result,
+      replacements: 1,
+      matches: [{ strategy: 'line-trimmed', occurrences: 2 }],
+    }),
+    false,
+    'without tolerant matching every edit matches exactly',
+  );
+
+  const legacy = { ...tolerant, edits: [{ oldText: 'a', newText: 'b' }] };
+  delete (legacy as { matching?: string }).matching;
+  assert.equal(
+    isWorkspaceToolResult(legacy, {
+      ...result,
+      replacements: 1,
+      matches: [{ strategy: 'exact', occurrences: 1 }],
+    }),
+    false,
+    'legacy requests never receive a matches field',
+  );
+});
+
+test('edit features advertise any unique subset of the known features', () => {
+  const valid = {
+    statefulWorkspace: true,
+    sandboxProfile: 'nsjail',
+    runtimes: ['bash'],
+    workspaceTools: {
+      protocolVersion: 1,
+      operations: ['read_file', 'edit_file'],
+      workspaces: [{ id: 'primary' }],
+      editFileModes: ['single', 'batch'],
+    },
+  };
+  const withFeatures = (editFileFeatures: unknown) => ({
+    ...valid,
+    workspaceTools: { ...valid.workspaceTools, editFileFeatures },
+  });
+  for (const features of [
+    ['expected_base_sha256'],
+    ['tolerant_match'],
+    ['expected_base_sha256', 'tolerant_match', 'replace_all'],
+  ]) {
+    assert.equal(isValidBridgeWorkerCapabilities(withFeatures(features)), true, features.join(','));
+  }
+  for (const features of [[], ['fuzzy'], ['replace_all', 'replace_all']]) {
+    assert.equal(isValidBridgeWorkerCapabilities(withFeatures(features)), false, features.join(','));
+  }
+});
+
+test('preview-only workers may advertise tolerant matching and replace-all, but not edit-only hashes', () => {
+  const previewOnly = {
+    statefulWorkspace: false,
+    sandboxProfile: 'native-srt',
+    runtimes: [],
+    workspaceTools: {
+      protocolVersion: 1,
+      operations: ['read_file', 'preview_edit'],
+      workspaces: [{ id: 'primary' }],
+      editFileModes: ['single', 'batch'],
+    },
+  };
+  for (const features of [
+    ['tolerant_match'],
+    ['replace_all'],
+    ['tolerant_match', 'replace_all'],
+  ]) {
+    assert.equal(isValidBridgeWorkerCapabilities({
+      ...previewOnly,
+      workspaceTools: { ...previewOnly.workspaceTools, editFileFeatures: features },
+    }), true, features.join(','));
+  }
+  assert.equal(isValidBridgeWorkerCapabilities({
+    ...previewOnly,
+    workspaceTools: {
+      ...previewOnly.workspaceTools,
+      editFileFeatures: ['expected_base_sha256', 'tolerant_match'],
+    },
+  }), false);
+});
+
 test('workspace commands require bounded sandbox inputs and outputs', () => {
   const request = {
     protocolVersion: 1 as const,
@@ -876,4 +1049,71 @@ test('workspace capabilities advertise linked-worktree scopes exactly', () => {
   assert.equal(isValidBridgeWorkerCapabilities(capabilities(['git_worktree'])), false);
   assert.equal(isValidBridgeWorkerCapabilities(capabilities([])), false);
   assert.equal(isValidBridgeWorkerCapabilities(capabilities('git_linked_worktree')), false);
+});
+
+test('command requests accept detached only as true and never with an environment action', () => {
+  const base = { protocolVersion: 1, operation: 'execute_command', workspaceId: 'repo', command: 'npm test' };
+  assert.equal(isWorkspaceToolRequest(base), true);
+  assert.equal(isWorkspaceToolRequest({ ...base, detached: true }), true);
+  assert.equal(isWorkspaceToolRequest({ ...base, detached: true, worktree: 'task-a', timeoutMs: 90_000 }), true);
+  assert.equal(isWorkspaceToolRequest({ ...base, detached: true, workspaceInstanceId: 'a'.repeat(64) }), true);
+  for (const detached of [false, 'true', 1, 0, null, {}, []]) {
+    assert.equal(isWorkspaceToolRequest({ ...base, detached }), false, JSON.stringify(detached));
+  }
+  const environmentAction = { name: 'test', fingerprint: 'f'.repeat(64) };
+  assert.equal(isWorkspaceToolRequest({ ...base, environmentAction }), true);
+  assert.equal(isWorkspaceToolRequest({ ...base, environmentAction, detached: true }), false);
+  assert.equal(
+    isWorkspaceToolRequest({ protocolVersion: 1, operation: 'read_file', workspaceId: 'repo', path: 'README.md', detached: true }),
+    false,
+  );
+});
+
+test('workspace capabilities advertise the detached command feature exactly', () => {
+  const capabilities = (operations: string[], commandFeatures: unknown) => ({
+    statefulWorkspace: false,
+    sandboxProfile: 'anthropic-srt',
+    runtimes: [],
+    workspaceTools: {
+      protocolVersion: 1,
+      operations,
+      workspaces: [{ id: 'repo' }],
+      commandFeatures,
+    },
+  });
+  assert.equal(isValidBridgeWorkerCapabilities(capabilities(['execute_command'], ['detached'])), true);
+  assert.equal(isValidBridgeWorkerCapabilities(capabilities(['read_file', 'execute_command'], undefined)), true);
+  assert.equal(isValidBridgeWorkerCapabilities(capabilities(['read_file'], ['detached'])), false);
+  for (const commandFeatures of [[], ['lane_git'], ['detached', 'detached'], 'detached', null, [true]]) {
+    assert.equal(
+      isValidBridgeWorkerCapabilities(capabilities(['execute_command'], commandFeatures)),
+      false,
+      JSON.stringify(commandFeatures),
+    );
+  }
+});
+
+test('a detached command key never equals or nests with a checkout or lane key', () => {
+  const instanceId = 'a'.repeat(64);
+  const detached = workspaceDetachedCommandKey('assignment-1');
+  const others = [
+    'repo',
+    'assignment-1',
+    workspaceIsolationKey('repo', instanceId),
+    workspaceIsolationKey('repo', undefined, 'task-a'),
+    workspaceIsolationKey('repo', instanceId, 'task-a'),
+    workspaceIsolationKey('repo', undefined, 'assignment-1'),
+    workspaceDetachedCommandKey('assignment-2'),
+  ];
+  assert.equal(isWorkspaceDetachedCommandKey(detached), true);
+  assert.equal(workspaceIsolationParent(detached), undefined);
+  assert.equal(workspaceIsolationKeysConflict(detached, detached), true);
+  for (const other of others) {
+    assert.notEqual(detached, other);
+    assert.equal(workspaceIsolationKeysConflict(detached, other), false, JSON.stringify(other));
+    assert.equal(workspaceIsolationKeysConflict(other, detached), false, JSON.stringify(other));
+  }
+  for (const other of others.slice(0, -1)) {
+    assert.equal(isWorkspaceDetachedCommandKey(other), false, JSON.stringify(other));
+  }
 });

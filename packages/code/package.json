@@ -1,6 +1,6 @@
 {
   "name": "@librechat/code",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "description": "LibreChat stateful code environment protocol and worker CLI",
   "license": "Apache-2.0",
   "type": "module",
@@ -18,6 +18,10 @@
     "./identity": {
       "types": "./dist/identity.d.ts",
       "import": "./dist/identity.js"
+    },
+    "./browser-enrollment": {
+      "types": "./dist/browser-enrollment-protocol.d.ts",
+      "import": "./dist/browser-enrollment-protocol.js"
     },
     "./worker": {
       "types": "./dist/worker.d.ts",
@@ -49,27 +53,43 @@
     }
   },
   "bin": {
+    "lc-code": "./dist/cli.js",
     "librechat-code": "./dist/cli.js"
   },
   "files": [
     "dist",
+    "LICENSE",
+    "NOTICE",
     "!dist/*.test.*"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/*.test.js",
-    "prepack": "npm run build"
+    "prepack": "node scripts/prepare-package.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.5.5",
     "typescript": "^5.5.4"
   },
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22.21"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.75",
     "koffi": "3.2.1",
     "yaml": "2.9.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LibreChat-AI/code-interpreter.git",
+    "directory": "packages/code"
+  },
+  "homepage": "https://github.com/LibreChat-AI/code-interpreter/tree/main/packages/code",
+  "bugs": {
+    "url": "https://github.com/LibreChat-AI/code-interpreter/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

@@ -67,6 +67,53 @@ Restoring a backup from *before* a revocation can revive trust; reconcile
 revocations after recovery from backup. Use a distinct server ID for each Code
 API deployment and keep it stable when the endpoint changes behind a proxy.
 
+### File server and Redis pairing
+
+Chat uploads, `import_file`, and generated files all pass through a file
+server. `FILE_SERVER_URL` names it for the API (the egress gateway reads
+`EGRESS_GATEWAY_FILE_SERVER_URL`, which defaults to the same value). **That
+file server must use the same Redis as this Code API**: the same
+`REDIS_HOST`/`REDIS_PORT` and logical database.
+
+The two are coupled through Redis and nothing else. Code API registers each
+upload session there before forwarding bytes; the file server reads the session
+back and writes the record that later authorizes the object for download, as an
+execution input, and for `import_file`. An isolated bridge API with its own
+Redis must therefore run its own file server on that Redis. Reusing another
+deployment's file server does not work, even though both answer requests.
+
+Two checks report a mismatch instead of letting it pass silently:
+
+- **At startup**, Code API writes a random key that expires after 60 seconds
+  and asks the file server, over the authenticated internal route
+  `POST /internal/store-probe`, whether it can see it.
+    - Same Redis: `File server shares this API's Redis` is logged once and the
+      check ends.
+    - Different Redis: `File server does not share this API's Redis` is logged
+      as an error and `/v1/health` answers `503` with
+      `{"status":"not ready","checks":{"fileServerStore":"mismatch"}}`. The
+      check repeats every 30 seconds and clears as soon as the file server is
+      corrected; Code API does not need a restart. The Helm chart uses
+      `/v1/health` for both probes, so the pod leaves the Service and is
+      restarted until then.
+    - Cannot tell: the file server is not up yet, predates the route, or
+      rejects the internal service token. Code API logs one warning naming the
+      reason, serves normally, and retries in the background (2 seconds,
+      doubling to 60). This is never treated as a mismatch, so Code API and the
+      file server can be upgraded in either order.
+- **On every upload**, the file server refuses a session it cannot find in its
+  own Redis with `409 UPLOAD_SESSION_UNKNOWN` and logs the cause. It stores
+  nothing. `/upload` then fails, `/upload/batch` reports the file as an error,
+  and a generated file is left out of the execution result. A session older
+  than `SESSION_CACHE_TTL` is refused the same way.
+
+Before these checks, a mismatched file server stored every upload under a
+record no reader looks up, and the only symptom was a later
+`403 IMPORT_SOURCE_UNAUTHORIZED` (or a failed download) for every file.
+
+Set `CODEAPI_FILE_SERVER_STORE_CHECK=false` on Code API to skip the startup
+check. The file server's refusal is not configurable.
+
 Use `strict` instead of `affinity` if every request must include a runtime
 session hint. In hardened mode, startup requires the bridge token to be at least
 32 bytes. `PTC_MODE=blocking` is rejected; replay mode is required because a
@@ -165,10 +212,18 @@ backslashes, symlink escapes, unexpected fields, and host roots are rejected.
 Workspace mutation remains disabled unless the operator starts the worker with
 `--allow-workspace-writes` (or
 `LIBRECHAT_CODE_ALLOW_WORKSPACE_WRITES=true`). That adds bounded `write_file`
-and exact-match `edit_file` operations. Writes are limited to 1 MiB of UTF-8
+and `edit_file` operations. `edit_file` matches exactly by default; the
+negotiated `tolerant_match` and `replace_all` edit features add
+whitespace-tolerant matching and multi-location replacement (see
+`packages/code/README.md`). Writes are limited to 1 MiB of UTF-8
 text, require an existing in-workspace parent directory, reject symlinks, and
 commit atomically. The worker capability is an enforcement boundary; LibreChat
 should still route every mutation through its configurable tool-approval hooks.
+Writable workers with a file relay upstream also offer `import_file` by
+default (opt out with `LIBRECHAT_CODE_ALLOW_WORKSPACE_IMPORTS=false`), which
+copies a chat upload the caller owns into the workspace through a one-object
+egress grant (ADR 0014). It is a file write: a worker without writes enabled
+never advertises it and refuses it with `WRITE_DISABLED`.
 
 The workspace root can be an existing project, a Git repository, or an empty
 directory; Git is not required. This boundary keeps that directory local to the
@@ -311,6 +366,13 @@ execution.
   (`worktree: <name>`) nests beneath its checkout's key: sibling lanes run
   concurrently, while a lane and its checkout exclude each other, and a lane
   cannot start while its checkout is quarantined.
+- An `execute_command` request marked `detached` takes a slot under a key of
+  its own instead of its worktree's, so other operations there are admitted
+  while it runs and it is admitted while they run. Detached commands may hold
+  at most one slot fewer than the negotiated count. Code API offers the feature
+  only above one slot (`CODEAPI_BRIDGE_DETACHED_COMMANDS=false` opts out) and
+  refuses the field for a worker that does not advertise
+  `commandFeatures: ['detached']`.
 - Workspace tool admission waits for capacity up to 30 seconds without a
   `X-LibreChat-Workspace-Queue-Wait-Ms` header. A caller can advertise a longer
   per-request allowance, bounded by five minutes and any server queue ceiling.
@@ -381,3 +443,58 @@ capabilities.
 LibreChat's owner-scoped environment registry can issue these principal-bound
 pairings without changing the worker execution protocol or moving code tools
 into the Agents SDK.
+
+### Durable workspace requests
+
+New clients can probe authenticated `GET /v1/workspace-tools/capabilities` for
+`durableWorkspaceRequests: 1`. Older servers return 404 or advertise 0. Keep the
+legacy synchronous `/workspace-tools/execute` path for those servers. Do not
+fall back to synchronous execution after submitting durable work.
+
+Submit the same workspace-tool body to `POST /v1/workspace-tools/requests`, with
+`X-LibreChat-Workspace-Request-Id` set to a unique 16–128 character identifier
+(letters, digits, `_`, `-`). The queue-wait header and command timeout retain their
+existing limits. HTTP 202 acknowledges durable acceptance, not execution.
+Disconnecting does not cancel accepted work.
+
+- Repeat an identical submission with the same ID to recover a lost response.
+  An ID reused for different work returns 409 `REQUEST_CONFLICT`.
+- Poll `GET /v1/workspace-tools/requests/:requestId`. States are `queued`,
+  `admitted`, `completed`, `failed`, and `cancelled`. Lookup is tenant/user scoped;
+  unknown or another principal's IDs return 404. Results are non-consuming reads.
+- Cancel with `DELETE /v1/workspace-tools/requests/:requestId`. Cancellation is a
+  request, not proof of termination. All operations notify the worker. A committed
+  result can win the race. Without a confirmed settlement, read-only calls retain
+  `cancelled`; mutations retain an unknown-outcome failure and their safety fence.
+  `ASSIGNMENT_EXPIRED` means execution may have occurred. Never replay it.
+- Status includes worker/workspace/lane metadata, queue position when available,
+  measured queue wait, and the execution deadline after admission. Queue position
+  is advisory: negotiated independent roots may run concurrently.
+
+Requests and results are retained for 24 hours from acceptance. Idempotency is
+bounded by that retention window. A client must not resubmit an expired ID after
+404; its outcome is unknown. Automatic result claims and wake-ups remain the
+client's responsibility.
+
+Bridge-enabled API replicas reconcile accepted work from Redis within a shared
+bridge-policy scope. Disabled bridges and different scheduling policies never
+claim that work. Keep backend/profile, bridge auth mode, worker selection, slot
+ceiling and command-timeout policy identical on replicas behind one endpoint.
+Drain durable requests before changing those settings. FIFO admission position
+survives API restarts and temporary worker registration/readiness loss until the
+queue deadline. Capacity acquisition and assignment enqueue atomically check the coordinator
+claim, queued state, cancellation and admission deadline. Delayed callbacks
+cannot reserve capacity after their claim ends. Assignment enqueue also checks
+capacity ownership and atomically commits the durable `admitted` transition.
+Recovery resumes only queued work and observes admitted assignments without
+creating another command. Worker identity/incarnation changes fail pending work
+rather than transferring it to another machine. Execution gets its full budget
+after admission. Existing lease fencing, cancellation and workspace quarantine
+continue to apply.
+
+This capability covers workspace tools, including `execute_command`, not
+programmatic `/execute` jobs. It requires Redis state to survive the API restart;
+Redis data loss is not recoverable. All API replicas behind an endpoint must
+support the capability before a client enables it. Roll back clients to the legacy
+path only for new work; drain durable requests before rolling back servers.
+Worker protocol, worker concurrency and deployed rate limits are unchanged.

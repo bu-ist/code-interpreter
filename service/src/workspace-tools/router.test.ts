@@ -223,6 +223,8 @@ test.each([
   ['COMMAND_TIMEOUT', 504],
   ['COMMAND_UNAVAILABLE', 503],
   ['COMMAND_DISABLED', 403],
+  ['INVALID_PATH', 422],
+  ['NOT_FOUND', 422],
 ] as const)('maps worker %s rejections to HTTP %i', async (errorCode, expectedStatus) => {
   const app = express();
   app.use(json());
@@ -532,11 +534,9 @@ test('logs a disconnected dispatch once without inventing HTTP 200', async () =>
   const settlementGate = Promise.withResolvers<void>();
   let dispatchAborted = false;
   let queueRemaining: number | undefined;
-  let closeConnection = (): void => { throw new Error('connection not ready'); };
   app.use(json());
   app.use((req, res, next) => {
     applyPrincipal(req, { userId: 'user-1', tenantId: 'tenant-1', principalSource: 'librechat_jwt', codeWorkerId: 'user-worker' });
-    closeConnection = (): void => { res.destroy(); };
     res.once('close', () => closed.resolve());
     next();
   });
@@ -576,7 +576,7 @@ test('logs a disconnected dispatch once without inventing HTTP 200', async () =>
     body: JSON.stringify({ protocolVersion: 1, operation: 'list_files', workspaceId: 'primary' }),
   });
   await started.promise;
-  closeConnection();
+  controller.abort();
   await expect(response).rejects.toThrow();
   await closed.promise;
   expect(queueRemaining).toBeGreaterThan(29_000);

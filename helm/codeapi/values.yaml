@@ -216,6 +216,12 @@ workerSandbox:
     affinity: {}
 
   sandboxRunner:
+    gracefulDrain:
+      enabled: false
+      minDelaySeconds: 5
+      timeoutSeconds: 45
+      retryAfterSeconds: 1
+      terminationGracePeriodSeconds: 60
     # Defaults to workerSandbox.replicaCount when unset.
     replicaCount: null
     # Restart a sandbox-runner before launcher/VMM host-side fd retention can
@@ -306,11 +312,12 @@ workerSandbox:
       forceRebuild: false
       image:
         repository: codeapi-package-init
+        # Pin this tag to the same immutable release as the runner in production.
         tag: latest
-        pullPolicy: IfNotPresent
+        pullPolicy: Always
       pythonVersion: "3.14.4"
-      nodeVersion: "24.15.0"
-      bunVersion: "1.3.14"
+      nodeVersion: "24.22.1"
+      bunVersion: "1.4.4"
       bashPackageVersion: "5.2.0"
       backoffLimit: 2
       ttlSecondsAfterFinished: 3600

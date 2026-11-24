@@ -421,6 +421,11 @@ fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
         "SANDBOX_COMPILE_TIMEOUT",
         "SANDBOX_DATA_DIRECTORY",
         "SANDBOX_DISABLE_NETWORKING",
+        "SANDBOX_GRACEFUL_DRAIN_ENABLED",
+        "SANDBOX_DRAIN_MIN_DELAY_MS",
+        "SANDBOX_DRAIN_TIMEOUT_MS",
+        "SANDBOX_DRAIN_RETRY_AFTER_SECONDS",
+        "SANDBOX_DRAIN_PUBLIC_KEY",
         "SANDBOX_HTTP_INPUT_CACHE_ENABLED",
         "SANDBOX_HTTP_INPUT_CACHE_MAX_INFLIGHT",
         "SANDBOX_HTTP_INPUT_CACHE_MAX_OBJECTS",
@@ -570,6 +575,16 @@ fn guest_cmdline_problem(env: &[(String, String)], args: &[String]) -> Option<St
     ))
 }
 
+fn enter_microvm(
+    filter_result: Result<usize, String>,
+    enter: impl FnOnce() -> i32,
+) -> Result<i32, String> {
+    let allowed = filter_result?;
+    eprintln!("[launcher] VMM seccomp filter applied ({allowed} syscalls allowed, ioctl restricted to KVM+terminal)");
+    eprintln!("[launcher] Starting microVM...");
+    Ok(enter())
+}
+
 fn main() {
     let vcpus: u8 = env::var("LAUNCHER_VCPUS")
         .ok()
@@ -701,16 +716,13 @@ fn main() {
         ffi::check("set_rlimits", ffi::krun_set_rlimits(ctx, rlimit_ptrs.as_ptr()));
         eprintln!("[launcher] Guest RLIMIT_NOFILE target: {nofile_target}");
 
-        match seccomp::apply_vmm_filter() {
-            Ok(n) => eprintln!("[launcher] VMM seccomp filter applied ({n} syscalls allowed, ioctl restricted to KVM+terminal)"),
-            Err(e) => {
-                eprintln!("[launcher] WARNING: Failed to apply VMM seccomp: {e}");
+        let ret = match enter_microvm(seccomp::apply_vmm_filter(), || ffi::krun_start_enter(ctx)) {
+            Ok(ret) => ret,
+            Err(error) => {
+                eprintln!("[launcher] ERROR: refusing to start microVM without VMM seccomp: {error}");
+                process::exit(1);
             }
-        }
-
-        eprintln!("[launcher] Starting microVM...");
-
-        let ret = ffi::krun_start_enter(ctx);
+        };
         eprintln!("[launcher] krun_start_enter returned {ret} (should not return on success)");
         process::exit(1);
     }
@@ -719,7 +731,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        desired_nofile_soft_limit, guest_cmdline_problem, guest_nofile_rlimit,
+        desired_nofile_soft_limit, enter_microvm, guest_cmdline_problem, guest_nofile_rlimit,
         is_allowed_guest_env_key, GUEST_CMDLINE_LIMIT, LIBKRUN_CMDLINE_RESERVE,
     };
 
@@ -736,6 +748,25 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn microvm_does_not_start_when_seccomp_installation_fails() {
+        let result = enter_microvm(Err("filter installation denied".into()), || {
+            panic!("microVM entry must not run without seccomp");
+        });
+        assert_eq!(result, Err("filter installation denied".into()));
+    }
+
+    #[test]
+    fn microvm_starts_after_seccomp_installation_succeeds() {
+        let mut entered = false;
+        let result = enter_microvm(Ok(80), || {
+            entered = true;
+            -1
+        });
+        assert!(entered);
+        assert_eq!(result, Ok(-1));
     }
 
     #[test]
@@ -848,6 +879,23 @@ mod tests {
             "PATH",
         ] {
             assert!(is_allowed_guest_env_key(key, true), "{key} should enter the sandbox guest");
+        }
+    }
+
+    #[test]
+    fn guest_env_allowlist_forwards_drain_settings_in_both_egress_modes() {
+        for egress_gateway_enabled in [false, true] {
+            for key in [
+                "SANDBOX_GRACEFUL_DRAIN_ENABLED",
+                "SANDBOX_DRAIN_MIN_DELAY_MS",
+                "SANDBOX_DRAIN_TIMEOUT_MS",
+                "SANDBOX_DRAIN_RETRY_AFTER_SECONDS",
+                "SANDBOX_DRAIN_PUBLIC_KEY",
+            ] {
+                assert!(is_allowed_guest_env_key(key, egress_gateway_enabled), "{key}");
+            }
+            assert!(!is_allowed_guest_env_key("SANDBOX_DRAIN_SECRET", egress_gateway_enabled));
+            assert!(!is_allowed_guest_env_key("SANDBOX_DRAIN_UNDECLARED", egress_gateway_enabled));
         }
     }
 

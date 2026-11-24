@@ -169,8 +169,11 @@ export function ensureNodeModulesSymlink(
   if (!nodeModulesPath) return;
   const linkPath = path.join(submissionDir, 'node_modules');
   try {
-    fs.lstatSync(linkPath);
-    return;
+    if (!fs.lstatSync(linkPath).isSymbolicLink()) return;
+    const target = path.resolve(submissionDir, fs.readlinkSync(linkPath));
+    const packageRoot = `${path.resolve(config.packages_directory)}${path.sep}`;
+    if (!target.startsWith(packageRoot) || target === path.resolve(nodeModulesPath)) return;
+    fs.unlinkSync(linkPath);
   } catch (err) {
     if (errorCode(err) !== 'ENOENT') throw err;
   }
@@ -701,7 +704,7 @@ export class Job {
   memory_limits: { run: number; compile: number };
   extra_env_vars?: Record<string, string>;
   egressGrantToken?: string;
-  toolCallSocketEnabled: boolean;
+  toolCallPipesEnabled: boolean;
   isSynthetic: boolean;
   outputSessionId: string;
 
@@ -786,7 +789,7 @@ export class Job {
     this.memory_limits = opts.memory_limits;
     this.extra_env_vars = opts.extra_env_vars;
     this.egressGrantToken = opts.egress_grant;
-    this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
+    this.toolCallPipesEnabled = opts.tool_call_socket_enabled === true;
     this.isSynthetic = opts.is_synthetic === true;
   }
 
@@ -1644,7 +1647,7 @@ export class Job {
       stdin,
       extraPkgdirs,
       identity: this.sandboxIdentity(),
-      enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
+      enableToolCallPipes: this.toolCallPipesEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
     });
   }

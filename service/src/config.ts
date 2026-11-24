@@ -7,13 +7,14 @@ import {
   resolveExecutionProfile,
   resolveExecutionProfileSource,
 } from './execution-profile';
+import { BRIDGE_WORKSPACE_IMPORT_FILE_DEFAULT_MAX_BYTES } from '../../packages/code/src/protocol';
 
 export const languageConfig: Record<Languages | string, t.LanguageConfig | undefined> = {
   [Languages.bash]: { language: 'bash', version: '5.2.0', fileName: 'script.sh' },
-  [Languages.js]: { language: 'bun-js', version: '1.3.14', fileName: 'index.js' },
-  [Languages.node]: { language: 'node', version: '24.15.0', fileName: 'index.js' },
+  [Languages.js]: { language: 'bun-js', version: '1.4.4', fileName: 'index.js' },
+  [Languages.node]: { language: 'node', version: '24.22.1', fileName: 'index.js' },
   [Languages.py]: { language: 'python', version: '3.14.4', fileName: 'main.py' },
-  [Languages.ts]: { language: 'bun-ts', version: '1.3.14', fileName: 'main.ts' },
+  [Languages.ts]: { language: 'bun-ts', version: '1.4.4', fileName: 'main.ts' },
 };
 
 const languageAliases: Record<string, Languages> = {
@@ -311,6 +312,8 @@ export const env = {
   SANDBOX_ENDPOINT: process.env.SANDBOX_ENDPOINT ?? 'http://localhost:2000/api/v2',
   EGRESS_GATEWAY_URL: process.env.EGRESS_GATEWAY_URL ?? '',
   FILE_SERVER_URL: process.env.FILE_SERVER_URL ?? 'http://localhost:3000',
+  /** Verify at startup that `FILE_SERVER_URL` shares this API's Redis (see `store-pairing.ts`). */
+  FILE_SERVER_STORE_CHECK: process.env.CODEAPI_FILE_SERVER_STORE_CHECK !== 'false',
   TOOL_CALL_SERVER_URL: process.env.TOOL_CALL_SERVER_URL ?? 'http://localhost:3033',
   EGRESS_GATEWAY_PORT: Number(process.env.EGRESS_GATEWAY_PORT) || 3190,
   EGRESS_GATEWAY_FILE_SERVER_URL: process.env.EGRESS_GATEWAY_FILE_SERVER_URL ?? process.env.FILE_SERVER_URL ?? 'http://localhost:3000',
@@ -419,6 +422,25 @@ export const env = {
   /** Opt-in independent native workspace concurrency; serial by default. */
   BRIDGE_MAX_WORKSPACE_LEASE_SLOTS: Number(
     process.env.CODEAPI_BRIDGE_MAX_WORKSPACE_LEASE_SLOTS ?? 1,
+  ),
+  /**
+   * Offer `lane_git` to workers and accept `laneGit` (`{ branch, head }`) on command results.
+   * Off by default: enable only after the LibreChat talking to this service accepts the field.
+   */
+  BRIDGE_LANE_GIT: process.env.CODEAPI_BRIDGE_LANE_GIT === 'true',
+  /**
+   * Offer `detached` commands to workers: an `execute_command` marked `detached` holds a
+   * worker slot but not its worktree. On by default wherever more than one workspace lease
+   * slot is allowed; set to `false` to keep every command serialized with its worktree.
+   */
+  BRIDGE_DETACHED_COMMANDS: process.env.CODEAPI_BRIDGE_DETACHED_COMMANDS !== 'false',
+  /**
+   * Largest stored object relayed into a worker by `import_file`. The operation
+   * is offered only when EGRESS_GATEWAY_URL can mint its one-object grant.
+   */
+  BRIDGE_IMPORT_FILE_MAX_BYTES: resolvePositiveIntEnv(
+    process.env.CODEAPI_BRIDGE_IMPORT_FILE_MAX_BYTES,
+    BRIDGE_WORKSPACE_IMPORT_FILE_DEFAULT_MAX_BYTES,
   ),
   /** Outbound worker selected by the remote-bridge backend. */
   BRIDGE_WORKER_ID: process.env.CODEAPI_BRIDGE_WORKER_ID ?? '',

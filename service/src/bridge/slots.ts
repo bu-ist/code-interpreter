@@ -1,4 +1,5 @@
 import type Redis from 'ioredis';
+import { durableAdmissionFence } from './admission';
 
 /** Hard bound keeps every atomic scheduling scan constant-sized. */
 export const MAX_WORKSPACE_LEASE_SLOTS = 8;
@@ -12,6 +13,10 @@ export const MAX_WORKSPACE_LEASE_SLOTS = 8;
  * with every lane beneath it. Sibling lanes run concurrently. A waiting checkout
  * request also holds back newer lanes beneath it, so root operations such as
  * `git worktree add` cannot be starved by a steady stream of lane work.
+ *
+ * A detached command key (`\0detached-command\0<assignment>`) conflicts with
+ * nothing and is held back by nothing but capacity. Detached commands may hold
+ * at most `capacity - 1` slots, so one slot always remains for other work.
  */
 export class BridgeWorkspaceSlots {
   constructor(private readonly redis: Redis) {}
@@ -37,6 +42,8 @@ export class BridgeWorkspaceSlots {
     workspaceId: string;
     capacity: number;
     expiresAtMs: number;
+    refreshOwned?: boolean;
+    guard?: { key: string; claimKey: string; token: string };
   }): Promise<number | undefined> {
     if (
       !Number.isSafeInteger(args.capacity) ||
@@ -48,9 +55,12 @@ export class BridgeWorkspaceSlots {
     ) {
       throw new Error('Invalid workspace slot reservation');
     }
+    const keys = this.keys(args.workerId);
+    if (args.guard != null) keys.push(args.guard.key, args.guard.claimKey);
     const result = Number(
       await this.redis.eval(
         [
+          ...(args.guard == null ? [] : durableAdmissionFence('KEYS[9]', 'KEYS[10]', 'ARGV[8]', -3)),
           "if redis.call('GET', KEYS[4]) ~= ARGV[1] then return -2 end",
           "if (redis.call('GET', KEYS[8]) or '1') ~= ARGV[4] then return -2 end",
           // Parent of a linked-worktree lane key; nil for a checkout key.
@@ -68,11 +78,16 @@ export class BridgeWorkspaceSlots {
           '  if last == nil or last <= #lanePrefix + 1 then return nil end',
           '  return string.sub(key, #lanePrefix + 1, last - 1)',
           'end',
+          'local detachedPrefix = "\\0detached-command\\0"',
+          'local function isDetached(key)',
+          '  return string.sub(key, 1, #detachedPrefix) == detachedPrefix',
+          'end',
           "local lock = redis.call('GET', KEYS[2])",
           "local owner = 'workspace-slots:' .. ARGV[1]",
           'if lock and lock ~= owner then return -1 end',
           'local busy = {}',
           'local busyChildren = {}',
+          'local detachedHeld = 0',
           'local free = nil',
           'local latest = tonumber(ARGV[5])',
           `for slot = 0, ${MAX_WORKSPACE_LEASE_SLOTS - 1} do`,
@@ -83,10 +98,19 @@ export class BridgeWorkspaceSlots {
           "      redis.call('HDEL', KEYS[1], 'a:' .. slot, 'i:' .. slot, 'w:' .. slot, 'e:' .. slot)",
           '      occupied = false',
           '    else',
-          '      if entry[1] == ARGV[2] then return slot end',
+          '      if entry[1] == ARGV[2] then',
+          '        if ARGV[7] == \'1\' then',
+          '          redis.call(\'HSET\', KEYS[1], \'e:\' .. slot, ARGV[5])',
+          '          for _, key in ipairs({KEYS[1], KEYS[2], KEYS[3]}) do',
+          '            if redis.call(\'PTTL\', key) < tonumber(ARGV[5]) - tonumber(ARGV[6]) then redis.call(\'PEXPIREAT\', key, ARGV[5]) end',
+          '          end',
+          '        end',
+          '        return slot',
+          '      end',
           '      busy[entry[3]] = true',
           '      local busyParent = parentOf(entry[3])',
           '      if busyParent then busyChildren[busyParent] = true end',
+          '      if isDetached(entry[3]) then detachedHeld = detachedHeld + 1 end',
           '      latest = math.max(latest, tonumber(entry[4]))',
           '    end',
           '  end',
@@ -94,6 +118,8 @@ export class BridgeWorkspaceSlots {
           'end',
           'local function conflicts(key)',
           '  if busy[key] then return true end',
+          // Beyond its own reservation, only the cap on detached holders holds a detached command back.
+          '  if isDetached(key) then return detachedHeld >= tonumber(ARGV[4]) - 1 end',
           '  local parent = parentOf(key)',
           '  if parent then return busy[parent] == true end',
           '  return busyChildren[key] == true',
@@ -116,7 +142,7 @@ export class BridgeWorkspaceSlots {
           '  local parent = parentOf(workspace)',
           '  local held = conflicts(workspace) or (parent ~= nil and waitingCheckouts[parent] == true)',
           '  if not held then selected = id; break end',
-          '  if parent == nil then waitingCheckouts[workspace] = true end',
+          '  if parent == nil and not isDetached(workspace) then waitingCheckouts[workspace] = true end',
           'end',
           'if selected ~= ARGV[2] then return -1 end',
           "redis.call('HSET', KEYS[1], 'a:' .. free, ARGV[2], 'i:' .. free, ARGV[1], 'w:' .. free, ARGV[3], 'e:' .. free, ARGV[5])",
@@ -125,14 +151,16 @@ export class BridgeWorkspaceSlots {
           "redis.call('SET', KEYS[3], ARGV[1], 'PXAT', latest)",
           'return free',
         ].join('\n'),
-        8,
-        ...this.keys(args.workerId),
+        keys.length,
+        ...keys,
         args.incarnationId,
         args.assignmentId,
         args.workspaceId,
         args.capacity,
         args.expiresAtMs,
         Date.now(),
+        args.refreshOwned === true ? '1' : '0',
+        args.guard?.token ?? '',
       ),
     );
     if (result === -2)
