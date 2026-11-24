@@ -14,6 +14,7 @@ export const languageConfig: Record<Languages | string, t.LanguageConfig | undef
   [Languages.js]: { language: 'bun-js', version: '1.4.4', fileName: 'index.js' },
   [Languages.node]: { language: 'node', version: '24.22.1', fileName: 'index.js' },
   [Languages.py]: { language: 'python', version: '3.14.4', fileName: 'main.py' },
+  [Languages.r]: { language: 'r', version: '4.5.2', fileName: 'script.R' },
   [Languages.ts]: { language: 'bun-ts', version: '1.4.4', fileName: 'main.ts' },
 };
 
@@ -43,6 +44,11 @@ const languageAliases: Record<string, Languages> = {
   // Bash
   bash: Languages.bash,
   sh: Languages.bash,
+
+  // R
+  r: Languages.r,
+  rscript: Languages.r,
+  rstats: Languages.r,
 };
 
 export function resolveLanguage(lang: string): Languages | undefined {

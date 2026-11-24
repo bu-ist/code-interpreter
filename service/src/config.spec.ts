@@ -71,6 +71,109 @@ describe('node language configuration', () => {
   });
 });
 
+describe('R language configuration', () => {
+  it('resolves R aliases', () => {
+    for (const alias of ['r', 'R', 'rscript', 'Rscript', 'rstats']) {
+      expect(resolveLanguage(alias)).toBe(Languages.r);
+    }
+  });
+
+  it('maps R requests to the r sandbox runtime', () => {
+    expect(languageConfig[Languages.r]).toEqual({
+      language: 'r',
+      version: '4.5.2',
+      fileName: 'script.R',
+    });
+  });
+
+  it('aligns the package installer and Helm with the selected R runtime', () => {
+    const root = path.resolve(__dirname, '../..');
+    const version = languageConfig[Languages.r]!.version;
+    expect(readFileSync(path.join(root, 'docker/package-init.sh'), 'utf8'))
+      .toContain(`R_VERSION="\${R_VERSION:-${version}}"`);
+    expect(readFileSync(path.join(root, 'helm/codeapi/values.yaml'), 'utf8'))
+      .toContain(`rVersion: "${version}"`);
+    // The image build must bake the same R the service asks the sandbox for;
+    // a mismatch resolves no runtime and fails every R job at dispatch.
+    expect(readFileSync(path.join(root, 'api/Dockerfile'), 'utf8'))
+      .toContain(`ENV R_VERSION=${version}`);
+  });
+
+  it('keeps /usr/bin/which resolvable inside the jail for R', () => {
+    // base::Sys.which() has "/usr/bin/which" compiled in at R's configure
+    // time, so no PATH entry substitutes for it. Debian points that path
+    // through /etc/alternatives, which the jail does not mount, so the link
+    // has to be collapsed into /usr at image build time. Without it utils'
+    // .onLoad fails, stats follows, and every R job dies with the unhelpful
+    // "Function not implemented".
+    const root = path.resolve(__dirname, '../..');
+    const dockerfile = readFileSync(path.join(root, 'api/Dockerfile'), 'utf8');
+    expect(dockerfile).toContain('ln -sf /usr/bin/which.debianutils /usr/bin/which');
+  });
+
+  it('keeps the R package manifest readable by package-init.sh', () => {
+    const root = path.resolve(__dirname, '../..');
+    const manifest = readFileSync(path.join(root, 'r-packages.txt'), 'utf8');
+    const lines = manifest.split('\n');
+
+    // package-init.sh stops at this exact header for R_PACKAGE_SET=core, so
+    // the tier split has to survive edits to the manifest.
+    const extendedAt = lines.findIndex(line => /^\s*#\s*---\s*extended/.test(line));
+    expect(extendedAt).toBeGreaterThan(0);
+
+    const isPackage = (line: string) => line.trim() !== '' && !line.trim().startsWith('#');
+    const core = lines.slice(0, extendedAt).filter(isPackage);
+    const extended = lines.slice(extendedAt + 1).filter(isPackage);
+
+    expect(core.length).toBeGreaterThan(0);
+    expect(extended.length).toBeGreaterThan(0);
+    // CRAN package names, not name@version: the snapshot date pins versions.
+    for (const name of [...core, ...extended]) {
+      expect(name.trim()).toMatch(/^[A-Za-z][A-Za-z0-9._]*$/);
+    }
+    // A package listed twice wastes build time and usually hides a typo.
+    const all = [...core, ...extended].map(name => name.trim());
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it('creates a valid R execution payload', () => {
+    const req = {
+      body: {
+        lang: 'r',
+        code: 'cat(mean(c(1, 2, 3)), "\\n")',
+        args: [],
+        files: [],
+      },
+    } as unknown as AuthenticatedRequest;
+
+    const payload = createPayload({
+      req,
+      isPyPlot: false,
+      session_id: 'session-r',
+    });
+
+    expect(payload).toMatchObject({
+      language: 'r',
+      version: '4.5.2',
+      session_id: 'session-r',
+      files: [
+        {
+          name: 'script.R',
+          content: 'cat(mean(c(1, 2, 3)), "\\n")',
+        },
+      ],
+    });
+  });
+
+  it('leaves R out of the programmatic tool-calling surface', () => {
+    // PTC generates a Python or bash preamble only. Adding R to Languages
+    // must not make it reachable there, or R code would be prefixed with a
+    // Python preamble and fail at parse.
+    expect(resolveLanguage('r')).not.toBe(Languages.py);
+    expect(resolveLanguage('r')).not.toBe(Languages.bash);
+  });
+});
+
 describe('runtime version configuration', () => {
   it('maps Python requests to Python 3.14.4', () => {
     expect(languageConfig[Languages.py]).toMatchObject({

@@ -1,5 +1,5 @@
 # Package Init Dockerfile
-# Builds Python, Node, Bun, and Bash runtime packages for the NsJail sandbox.
+# Builds Python, Node, Bun, Bash, and R runtime packages for the NsJail sandbox.
 # Runs as a Kubernetes init job to populate the packages PVC.
 #
 # Usage:
@@ -13,19 +13,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
 
+# The last two lines are R's toolchain: CRAN ships no arm64 Linux binaries, so
+# every R package in r-packages.txt is compiled here from source. cmake is for
+# nloptr, which builds a bundled NLopt (and which lme4 and car need);
+# libuv1-dev is for fs, which stopped bundling libuv (and which sass, bslib,
+# htmlwidgets and plotly need).
 RUN apt-install \
     curl unzip wget ca-certificates \
     build-essential libssl-dev libffi-dev libsqlite3-dev \
     zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
     tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
     libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-    libfreetype6-dev
+    libfreetype6-dev \
+    gfortran libblas-dev liblapack-dev libicu-dev libpcre2-dev \
+    liblzma-dev libjpeg-dev libtiff-dev cmake libuv1-dev
 
 RUN mkdir -p /pkgs
 
 COPY docker/python-runtime /python-runtime
 COPY docker/package-init.sh /package-init.sh
 COPY javascript-packages.txt /javascript-packages.txt
+COPY r-packages.txt /r-packages.txt
 RUN chmod +x /package-init.sh
 
 CMD ["/package-init.sh"]

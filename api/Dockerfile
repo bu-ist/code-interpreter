@@ -65,23 +65,37 @@ FROM buildpack-deps:bookworm AS package-builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHON_VERSION=3.14.4
 ENV BUN_VERSION=1.4.4
+ENV R_VERSION=4.5.2
+# "core" builds only the first tier of r-packages.txt, for faster local
+# iteration. Image builds for a deployed environment keep the default.
+ARG R_PACKAGE_SET=full
+ENV R_PACKAGE_SET=${R_PACKAGE_SET}
 
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
 
+# The last two lines are R's toolchain: CRAN ships no arm64 Linux binaries, so
+# every R package in r-packages.txt is compiled here from source. cmake is for
+# nloptr, which builds a bundled NLopt (and which lme4 and car need);
+# libuv1-dev is for fs, which stopped bundling libuv (and which sass, bslib,
+# htmlwidgets and plotly need). All of this stays in the builder; only the
+# rendered /pkgs tree reaches the runner.
 RUN apt-install \
     curl unzip wget ca-certificates \
     build-essential libssl-dev libffi-dev libsqlite3-dev \
     zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
     tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
     libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-    libfreetype6-dev
+    libfreetype6-dev \
+    gfortran libblas-dev liblapack-dev libicu-dev libpcre2-dev \
+    liblzma-dev libjpeg-dev libtiff-dev cmake libuv1-dev
 
 RUN mkdir -p /pkgs
 
 COPY docker/python-runtime /python-runtime
 COPY docker/package-init.sh /package-init.sh
 COPY javascript-packages.txt /javascript-packages.txt
+COPY r-packages.txt /r-packages.txt
 RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
 
 # ============================================================================
@@ -124,6 +138,25 @@ RUN apt-get update && \
 # coreutils) — mawk has no system() / getline-from-command extensions
 # in its minimal build.
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
+
+# Point /usr/bin/which straight at the binary instead of through
+# update-alternatives. Debian ships it as /usr/bin/which ->
+# /etc/alternatives/which -> /usr/bin/which.debianutils, and the jail mounts
+# /usr but not /etc/alternatives, so inside the sandbox that chain dangles and
+# `which` is unusable even though it looks present in the image. Two things
+# need it to work:
+#   * bare `which ...` in user shell scripts, as with `awk` above — /bin/sh
+#     (dash) has no `which` builtin;
+#   * R. base::Sys.which() has "/usr/bin/which" compiled in at R's configure
+#     time, so no PATH entry can substitute for it. utils' .onLoad calls
+#     Sys.which("uname"), so a broken link makes utils fail to load, takes
+#     stats down with it (stats imports from utils), and leaves every package
+#     importing either unusable — surfaced as "Function not implemented",
+#     which does not resemble the cause.
+# Same binary either way, so no new surface: only the path to it changes.
+RUN [ -x /usr/bin/which.debianutils ] \
+    && ln -sf /usr/bin/which.debianutils /usr/bin/which \
+    && [ "$(readlink /usr/bin/which)" = /usr/bin/which.debianutils ]
 
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
