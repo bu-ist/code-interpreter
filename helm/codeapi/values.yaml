@@ -319,6 +319,7 @@ workerSandbox:
       nodeVersion: "24.22.1"
       bunVersion: "1.4.4"
       bashPackageVersion: "5.2.0"
+      rVersion: "4.5.2"
       backoffLimit: 2
       ttlSecondsAfterFinished: 3600
       resources:

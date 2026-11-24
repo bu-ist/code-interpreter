@@ -51,6 +51,8 @@ spec:
               value: {{ .Values.workerSandbox.packages.initJob.bunVersion | quote }}
             - name: BASH_PACKAGE_VERSION
               value: {{ .Values.workerSandbox.packages.initJob.bashPackageVersion | quote }}
+            - name: R_VERSION
+              value: {{ .Values.workerSandbox.packages.initJob.rVersion | quote }}
             - name: FORCE_REBUILD
               value: {{ .Values.workerSandbox.packages.initJob.forceRebuild | quote }}
           volumeMounts:

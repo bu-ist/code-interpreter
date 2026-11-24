@@ -7,5 +7,6 @@ export enum Languages {
   js = 'js',
   node = 'node',
   py = 'py',
+  r = 'r',
   ts = 'ts',
 }

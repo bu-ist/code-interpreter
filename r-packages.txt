@@ -1,0 +1,56 @@
+# Offline R package set for the R sandbox runtime.
+#
+# Reproducibility: R packages are installed from the dated CRAN snapshot in
+# R_CRAN_REPO (see docker/package-init.sh), not from a moving CRAN mirror, so
+# a rebuild of the same commit resolves the same package versions. That is why
+# entries here are bare names rather than name@version as in
+# javascript-packages.txt — the snapshot date pins the whole set at once.
+#
+# Tiers: the "core" set below the first header is the minimum useful runtime.
+# Everything under the "extended" header is additionally installed unless
+# R_PACKAGE_SET=core is set. Local developer builds can pass R_PACKAGE_SET=core
+# to keep image build times short; image builds for a deployed environment use
+# the default (both tiers).
+#
+# Every package is compiled from source: CRAN publishes no arm64 Linux
+# binaries, so anything added here must build cleanly from source with the
+# toolchain installed in the package-builder stage.
+
+# --- core ---
+data.table
+jsonlite
+dplyr
+tidyr
+ggplot2
+readr
+stringr
+lubridate
+purrr
+tibble
+scales
+janitor
+
+# --- extended ---
+broom
+car
+caret
+DBI
+RSQLite
+e1071
+forcats
+forecast
+glmnet
+httr2
+knitr
+lme4
+openxlsx
+patchwork
+plotly
+randomForest
+RColorBrewer
+readxl
+reshape2
+viridis
+writexl
+xts
+zoo

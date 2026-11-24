@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Package Init Script
-# Installs Python, Node, Bun, and Bash runtime packages for the NsJail sandbox.
+# Installs Python, Node, Bun, Bash, and R runtime packages for the NsJail sandbox.
 # Runs inside the package-init container to populate the packages PVC.
 #
 
@@ -23,8 +23,18 @@ UV_VERSION="${UV_VERSION:-0.11.26}"
 NODE_VERSION="${NODE_VERSION:-24.22.1}"
 BUN_VERSION="${BUN_VERSION:-1.4.4}"
 BASH_PACKAGE_VERSION="${BASH_PACKAGE_VERSION:-5.2.0}"
+R_VERSION="${R_VERSION:-4.5.2}"
+# CRAN publishes no arm64 Linux binaries, so every R package is compiled from
+# source. A dated snapshot — not a moving mirror — keeps that compile
+# reproducible: the same commit resolves the same package versions on a
+# rebuild. Bump this date deliberately, the way a pinned version is bumped.
+R_CRAN_REPO="${R_CRAN_REPO:-https://packagemanager.posit.co/cran/2026-11-03}"
+# "core" installs only the first tier of r-packages.txt (shorter local builds);
+# the default installs every tier.
+R_PACKAGE_SET="${R_PACKAGE_SET:-full}"
 INSTALL_FAILED=false
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
+R_PACKAGE_MANIFEST="${R_PACKAGE_MANIFEST:-${SCRIPT_DIR}/r-packages.txt}"
 
 load_js_packages() {
     if [ ! -f "$JS_PACKAGE_MANIFEST" ]; then
@@ -98,7 +108,8 @@ packages_ready() {
     js_packages_ready "/pkgs/node/${NODE_VERSION}" &&
     [ -f "/pkgs/bun/${BUN_VERSION}/.package-installed" ] &&
     js_packages_ready "/pkgs/bun/${BUN_VERSION}" &&
-    [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ]
+    [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ] &&
+    [ -f "/pkgs/r/${R_VERSION}/.package-installed" ]
 }
 
 write_node_launcher() {
@@ -563,6 +574,234 @@ echo "$(date +%s)000" > "$BASH_DEST/.package-installed"
 echo "Bash ${BASH_PACKAGE_VERSION} registered (using system binary ${SYSTEM_BASH_VERSION})"
 
 # ==============================
+# Install R
+# ==============================
+echo ""
+echo "=============================================="
+echo "  Installing R ${R_VERSION}"
+echo "=============================================="
+echo ""
+
+# R is installed from the Posit r-builds Debian package rather than from
+# Debian's own r-base (4.2.x on bookworm) or from source. CRAN serves no arm64
+# Linux binaries at all, and arm64 is mandatory for the Lambda MicroVM sandbox,
+# so this is the only route to a current R that does not add a ~15 minute
+# source build to every image rebuild.
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)        R_ARCH="amd64" ;;
+    aarch64|arm64) R_ARCH="arm64" ;;
+    *)
+        echo "ERROR: Unsupported architecture for R: $ARCH"
+        R_ARCH=""
+        INSTALL_FAILED=true
+        ;;
+esac
+
+R_DEST="/pkgs/r/${R_VERSION}"
+
+if [ -n "$R_ARCH" ]; then
+    R_DEB_URL="https://cdn.posit.co/r/debian-12/pkgs/r-${R_VERSION}_1_${R_ARCH}.deb"
+    rm -rf "$R_DEST"
+    mkdir -p /pkgs/r
+
+    if curl -fsSL -o /tmp/r.deb "$R_DEB_URL" \
+        && apt-install /tmp/r.deb; then
+        rm -f /tmp/r.deb
+
+        # The package installs under /opt, which is not mounted inside the
+        # NsJail mount namespace — only /usr and the selected runtime's
+        # directory under /pkgs are. Move it where the jail can see it.
+        mv "/opt/R/${R_VERSION}" "$R_DEST"
+        rmdir /opt/R 2>/dev/null || true
+
+        # R_HOME is baked into these text files at package build time. The
+        # verification below is what keeps this list honest — add to it there
+        # rather than trusting this list to stay complete.
+        for relative in \
+            bin/R \
+            lib/R/bin/R \
+            lib/R/etc/Makeconf \
+            lib/R/etc/ldpaths \
+            lib/pkgconfig/libR.pc
+        do
+            if [ -f "${R_DEST}/${relative}" ]; then
+                sed -i "s|/opt/R/${R_VERSION}|${R_DEST}|g" "${R_DEST}/${relative}"
+            fi
+        done
+
+        # The stock Rscript is an ELF with R_HOME compiled in; it ignores the
+        # R_HOME environment variable and execs the old /opt path, so it cannot
+        # be relocated. Replace it with a wrapper over the (patched) R shell
+        # script, which honours the relocation.
+        #
+        # Both copies must be replaced. R ships one at bin/Rscript for users
+        # and one at lib/R/bin/Rscript, and package build scripts call the
+        # latter through R_HOME. Leaving it unpatched silently breaks any
+        # package whose configure step shells out to Rscript (fs, sass,
+        # htmlwidgets, ...) and everything depending on them, while packages
+        # that build without it install fine — so the damage is partial and
+        # easy to miss.
+        for rscript in "${R_DEST}/bin/Rscript" "${R_DEST}/lib/R/bin/Rscript"; do
+            cat > "$rscript" << RSCRIPT
+#!/bin/bash
+R_BIN="${R_DEST}/bin/R"
+if [ "\$#" -eq 0 ] || [ "\${1#-}" != "\$1" ]; then
+    # No file argument, or a flag such as -e: hand through unchanged.
+    exec "\$R_BIN" --no-echo --no-restore "\$@"
+fi
+script="\$1"
+shift
+exec "\$R_BIN" --no-echo --no-restore --file="\$script" --args "\$@"
+RSCRIPT
+            chmod +x "$rscript"
+        done
+
+        # Nothing else may still point at the pre-relocation prefix: a missed
+        # file fails later, during a package build or at run time, with an
+        # error that names neither R nor the path.
+        if grep -rl "/opt/R/${R_VERSION}" "$R_DEST" >/dev/null 2>&1; then
+            echo "ERROR: files still reference /opt/R/${R_VERSION} after relocation:"
+            grep -rl "/opt/R/${R_VERSION}" "$R_DEST" | sed "s|^|  |"
+            INSTALL_FAILED=true
+        fi
+
+        mkdir -p "${R_DEST}/lib/R/site-library"
+        echo "R ${R_VERSION} installed to ${R_DEST}"
+    else
+        echo "ERROR: Failed to install R from ${R_DEB_URL}"
+        INSTALL_FAILED=true
+        R_ARCH=""
+    fi
+fi
+
+# ==============================
+# Install R packages
+# ==============================
+if [ -n "$R_ARCH" ]; then
+    echo ""
+    echo "=============================================="
+    echo "  Installing R packages (${R_PACKAGE_SET})"
+    echo "=============================================="
+    echo ""
+
+    if [ ! -f "$R_PACKAGE_MANIFEST" ]; then
+        echo "ERROR: Missing R package manifest: $R_PACKAGE_MANIFEST"
+        INSTALL_FAILED=true
+    else
+        R_PACKAGES=()
+        while IFS= read -r package_spec || [ -n "$package_spec" ]; do
+            # The extended tier starts at its header; stop there for "core".
+            if [[ "$package_spec" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*extended ]]; then
+                [ "$R_PACKAGE_SET" = "core" ] && break
+                continue
+            fi
+            [[ "$package_spec" =~ ^[[:space:]]*(#|$) ]] && continue
+            R_PACKAGES+=("$package_spec")
+        done < "$R_PACKAGE_MANIFEST"
+
+        if [ ${#R_PACKAGES[@]} -eq 0 ]; then
+            echo "ERROR: No R packages listed in $R_PACKAGE_MANIFEST"
+            INSTALL_FAILED=true
+        else
+            echo "Installing ${#R_PACKAGES[@]} R packages from ${R_CRAN_REPO}"
+            R_PACKAGE_VECTOR=$(printf '"%s",' "${R_PACKAGES[@]}")
+            R_PACKAGE_VECTOR="${R_PACKAGE_VECTOR%,}"
+
+            # Driven from a script file rather than -e: the installer is
+            # multi-statement, and --file has unambiguous parsing.
+            #
+            # Ncpus parallelises independent packages. The explicit check
+            # afterwards is required because install.packages() reports a
+            # failed build as a warning and still exits 0.
+            cat > /tmp/install-r-packages.R << RINSTALL
+pkgs <- c(${R_PACKAGE_VECTOR})
+lib <- "${R_DEST}/lib/R/site-library"
+install.packages(pkgs,
+                 repos = "${R_CRAN_REPO}",
+                 lib = lib,
+                 Ncpus = max(1L, parallel::detectCores()))
+missing <- pkgs[!pkgs %in% rownames(installed.packages(lib.loc = lib))]
+if (length(missing)) {
+    cat("FAILED R packages:", paste(missing, collapse = ", "), "\n")
+    quit(status = 1L)
+}
+cat("All", length(pkgs), "R packages installed\n")
+RINSTALL
+
+            if "${R_DEST}/bin/R" --no-echo --no-restore --file=/tmp/install-r-packages.R; then
+                echo "R packages installed"
+            else
+                echo "ERROR: One or more R packages failed to install"
+                INSTALL_FAILED=true
+            fi
+            rm -f /tmp/install-r-packages.R
+        fi
+    fi
+fi
+
+# ==============================
+# Register R
+# ==============================
+if [ -n "$R_ARCH" ] && [ "$INSTALL_FAILED" != true ]; then
+    echo ""
+    echo "=============================================="
+    echo "  Registering R"
+    echo "=============================================="
+    echo ""
+
+    # R is built here on Debian 12 but runs in a Debian 13 sandbox image, and
+    # the jail exposes no /usr from this builder. Carry every shared object R
+    # resolves outside /pkgs so the runtime depends on nothing in the final
+    # image. glibc, libgcc and libstdc++ are deliberately excluded: those must
+    # come from the running image, which is never older than this builder.
+    mkdir -p "${R_DEST}/syslib"
+    find "$R_DEST" -type f \( -name '*.so' -o -name '*.so.*' -o -path '*/bin/exec/R' \) -print0 \
+        | xargs -0 -r -n1 ldd 2>/dev/null \
+        | awk '/=> \// {print $3}' \
+        | sort -u \
+        | grep -v '^/pkgs' \
+        | grep -vE '/(ld-linux[^/]*|libc|libm|libdl|libpthread|librt|libresolv|libgcc_s|libstdc\+\+)\.so' \
+        > /tmp/r-syslibs.txt
+    while IFS= read -r lib; do
+        [ -n "$lib" ] && cp -Ln "$lib" "${R_DEST}/syslib/" 2>/dev/null || true
+    done < /tmp/r-syslibs.txt
+    echo "Carried $(ls -1 "${R_DEST}/syslib" | wc -l) shared libraries into ${R_DEST}/syslib"
+    rm -f /tmp/r-syslibs.txt
+
+    cat > "$R_DEST/pkg-info.json" << EOF
+{
+    "language": "r",
+    "version": "${R_VERSION}",
+    "build_platform": "docker-debian",
+    "aliases": ["rscript", "rstats"]
+}
+EOF
+
+    cat > "$R_DEST/run" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${SCRIPT_DIR}/bin/Rscript" "$@"
+EOF
+    chmod +x "$R_DEST/run"
+
+    # R_HOME and LD_LIBRARY_PATH are required because the install is relocated
+    # away from its compiled-in prefix. OPENBLAS/OMP thread counts are left to
+    # the sandbox defaults (1), which keeps BLAS from forking past the jail's
+    # process limit.
+    {
+        echo "PATH=${R_DEST}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:."
+        echo "R_HOME=${R_DEST}/lib/R"
+        echo "LD_LIBRARY_PATH=${R_DEST}/lib/R/lib:${R_DEST}/syslib"
+        echo "R_LIBS_SITE=${R_DEST}/lib/R/site-library"
+    } > "$R_DEST/.env"
+
+    echo "$(date +%s)000" > "$R_DEST/.package-installed"
+
+    echo "R ${R_VERSION} registered"
+fi
+
+# ==============================
 # Finalize
 # ==============================
 echo ""
@@ -595,6 +834,7 @@ initialized_at=$(date -Iseconds)
 python_version=${PYTHON_VERSION}
 node_version=${NODE_VERSION}
 bun_version=${BUN_VERSION}
+r_version=${R_VERSION}
 packages=$(ls /pkgs/ 2>/dev/null | tr '\n' ',')
 MARKER
 
