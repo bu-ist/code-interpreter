@@ -600,8 +600,30 @@ esac
 
 R_DEST="/pkgs/r/${R_VERSION}"
 
+# Posit publishes one build per Debian release and they are NOT interchangeable.
+# The bookworm build installs cleanly on trixie — apt resolves every dependency —
+# and then fails at run time with "libtirpc.so.3: cannot open shared object
+# file", because the t64 transition renamed the package that ships it. An
+# install that succeeds and a binary that cannot start is the worst failure mode
+# available, so pick the build by the release actually running this script
+# rather than hardcoding one: api/Dockerfile's package-builder is bookworm,
+# while the BU sandbox stages are trixie.
+if [ -z "${R_DEB_DISTRO:-}" ]; then
+    r_os_version=$( . /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}" )
+    case "$r_os_version" in
+        12) R_DEB_DISTRO="debian-12" ;;
+        13) R_DEB_DISTRO="debian-13" ;;
+        *)
+            echo "ERROR: No known Posit R build for Debian VERSION_ID='${r_os_version}'."
+            echo "       Set R_DEB_DISTRO explicitly if a build exists for it."
+            R_ARCH=""
+            INSTALL_FAILED=true
+            ;;
+    esac
+fi
+
 if [ -n "$R_ARCH" ]; then
-    R_DEB_URL="https://cdn.posit.co/r/debian-12/pkgs/r-${R_VERSION}_1_${R_ARCH}.deb"
+    R_DEB_URL="https://cdn.posit.co/r/${R_DEB_DISTRO}/pkgs/r-${R_VERSION}_1_${R_ARCH}.deb"
     rm -rf "$R_DEST"
     mkdir -p /pkgs/r
 

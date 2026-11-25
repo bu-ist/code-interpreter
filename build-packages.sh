@@ -29,8 +29,14 @@ cd "$SCRIPT_DIR"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 NODE_VERSION="${NODE_VERSION:-24.22.1}"
 BUN_VERSION="${BUN_VERSION:-1.4.4}"
+R_VERSION="${R_VERSION:-4.5.2}"
 PACKAGES_DIR="./data/pkgs"
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
+R_PACKAGE_MANIFEST="${R_PACKAGE_MANIFEST:-${SCRIPT_DIR}/r-packages.txt}"
+# Keep these aligned with docker/package-init.sh, which is the implementation
+# the deployed images use. This script is the local-developer path only.
+R_CRAN_REPO="${R_CRAN_REPO:-https://packagemanager.posit.co/cran/2026-11-03}"
+R_PACKAGE_SET="${R_PACKAGE_SET:-core}"
 
 load_js_packages() {
     if [ ! -f "$JS_PACKAGE_MANIFEST" ]; then
@@ -71,8 +77,8 @@ fi
 
 ARCH=$(uname -m)
 case "$ARCH" in
-    x86_64)  BUN_ARCH="x64"; NODE_ARCH="x64"; echo "Detected: amd64 (Linux/WSL)" ;;
-    arm64|aarch64) BUN_ARCH="aarch64"; NODE_ARCH="arm64"; echo "Detected: arm64 (Apple Silicon)" ;;
+    x86_64)  BUN_ARCH="x64"; NODE_ARCH="x64"; R_ARCH="amd64"; echo "Detected: amd64 (Linux/WSL)" ;;
+    arm64|aarch64) BUN_ARCH="aarch64"; NODE_ARCH="arm64"; R_ARCH="arm64"; echo "Detected: arm64 (Apple Silicon)" ;;
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
@@ -517,6 +523,162 @@ EOF
     echo "Bash ${bash_package_version} registered (using system binary ${system_bash_version})"
 }
 
+# Mirrors the R section of docker/package-init.sh, which is the implementation
+# the deployed images use; keep the two in step. Defaults to R_PACKAGE_SET=core
+# here because this is the local-developer path and the extended tier adds a
+# long source build. Every R package compiles from source: CRAN ships no arm64
+# Linux binaries.
+install_r() {
+    if [ "${SKIP_R:-}" = "1" ]; then
+        echo "Skipping R (SKIP_R=1)"
+        return 0
+    fi
+
+    local pkg_dest="/pkgs/r/${R_VERSION}"
+
+    echo "=============================================="
+    echo "  Installing R ${R_VERSION} (${R_PACKAGE_SET})"
+    echo "=============================================="
+
+    if [ ! -f "$R_PACKAGE_MANIFEST" ]; then
+        echo "ERROR: Missing R package manifest: $R_PACKAGE_MANIFEST" >&2
+        return 1
+    fi
+
+    local r_packages=()
+    while IFS= read -r package_spec || [ -n "$package_spec" ]; do
+        if [[ "$package_spec" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*extended ]]; then
+            [ "$R_PACKAGE_SET" = "core" ] && break
+            continue
+        fi
+        [[ "$package_spec" =~ ^[[:space:]]*(#|$) ]] && continue
+        r_packages+=("$package_spec")
+    done < "$R_PACKAGE_MANIFEST"
+    if [ "${#r_packages[@]}" -eq 0 ]; then
+        echo "ERROR: No R packages listed in $R_PACKAGE_MANIFEST" >&2
+        return 1
+    fi
+
+    # The builder container is buildpack-deps:bookworm. Posit's builds are not
+    # interchangeable across Debian releases: a bookworm build installs on
+    # trixie and then fails to start on libtirpc.so.3.
+    docker exec "$CONTAINER_NAME" bash -c "
+        set -e
+        rm -rf ${pkg_dest}
+        mkdir -p /pkgs/r
+        curl -fsSL -o /tmp/r.deb \
+            https://cdn.posit.co/r/debian-12/pkgs/r-${R_VERSION}_1_${R_ARCH}.deb
+        # main() purges /var/lib/apt/lists, and the R package pulls in
+        # libopenblas-dev, libpaper-utils and zip. Without a refresh those read
+        # as 'not installable'. docker/apt-install.sh refreshes for the same
+        # reason, which is why the image build path does not hit this.
+        apt-get update
+        apt-get install -y --no-install-recommends /tmp/r.deb
+        rm -rf /tmp/r.deb /var/lib/apt/lists/*
+        # The package installs under /opt, which the NsJail mount namespace does
+        # not expose. Move it where the jail can see it and repoint R_HOME,
+        # which is baked into these files at package build time.
+        mv /opt/R/${R_VERSION} ${pkg_dest}
+        rmdir /opt/R 2>/dev/null || true
+        for relative in bin/R lib/R/bin/R lib/R/etc/Makeconf lib/R/etc/ldpaths lib/pkgconfig/libR.pc; do
+            [ -f \"${pkg_dest}/\$relative\" ] && \
+                sed -i \"s|/opt/R/${R_VERSION}|${pkg_dest}|g\" \"${pkg_dest}/\$relative\"
+        done
+        # Stock Rscript is an ELF with R_HOME compiled in and cannot be
+        # relocated. Both copies must be replaced: package build scripts reach
+        # the lib/R/bin one through R_HOME, and leaving it breaks any package
+        # whose configure step shells out to Rscript.
+        for rscript in ${pkg_dest}/bin/Rscript ${pkg_dest}/lib/R/bin/Rscript; do
+            cat > \"\$rscript\" << 'RSCRIPT'
+#!/bin/bash
+R_BIN=\"${pkg_dest}/bin/R\"
+if [ \"\$#\" -eq 0 ] || [ \"\${1#-}\" != \"\$1\" ]; then
+    exec \"\$R_BIN\" --no-echo --no-restore \"\$@\"
+fi
+script=\"\$1\"
+shift
+exec \"\$R_BIN\" --no-echo --no-restore --file=\"\$script\" --args \"\$@\"
+RSCRIPT
+            chmod +x \"\$rscript\"
+        done
+        if grep -rl \"/opt/R/${R_VERSION}\" ${pkg_dest} >/dev/null 2>&1; then
+            echo 'ERROR: files still reference the pre-relocation prefix' >&2
+            exit 1
+        fi
+        mkdir -p ${pkg_dest}/lib/R/site-library
+    "
+
+    local r_vector
+    r_vector=$(printf '"%s",' "${r_packages[@]}")
+    r_vector="${r_vector%,}"
+    # install.packages() reports a failed build as a warning and still exits 0,
+    # so the explicit check afterwards is what makes this fail loudly.
+    docker exec "$CONTAINER_NAME" bash -c "
+        set -e
+        cat > /tmp/install-r-packages.R << RINSTALL
+pkgs <- c(${r_vector})
+lib <- \"${pkg_dest}/lib/R/site-library\"
+install.packages(pkgs, repos = \"${R_CRAN_REPO}\", lib = lib,
+                 Ncpus = max(1L, parallel::detectCores()))
+missing <- pkgs[!pkgs %in% rownames(installed.packages(lib.loc = lib))]
+if (length(missing)) {
+    cat(\"FAILED R packages:\", paste(missing, collapse = \", \"), \"\n\")
+    quit(status = 1L)
+}
+cat(\"All\", length(pkgs), \"R packages installed\n\")
+RINSTALL
+        ${pkg_dest}/bin/R --no-echo --no-restore --file=/tmp/install-r-packages.R
+        rm -f /tmp/install-r-packages.R
+    "
+
+    # Carry every shared object R resolves outside /pkgs, so the runtime does not
+    # depend on the builder's /usr. glibc, libgcc and libstdc++ stay excluded:
+    # those come from the running image, which is never older than this builder.
+    docker exec "$CONTAINER_NAME" bash -c "
+        set -e
+        mkdir -p ${pkg_dest}/syslib
+        find ${pkg_dest} -type f \\( -name '*.so' -o -name '*.so.*' -o -path '*/bin/exec/R' \\) -print0 \
+            | xargs -0 -r -n1 ldd 2>/dev/null \
+            | awk '/=> \\// {print \$3}' \
+            | sort -u \
+            | grep -v '^/pkgs' \
+            | grep -vE '/(ld-linux[^/]*|libc|libm|libdl|libpthread|librt|libresolv|libgcc_s|libstdc\\+\\+)\\.so' \
+            > /tmp/r-syslibs.txt
+        while IFS= read -r lib; do
+            [ -n \"\$lib\" ] && cp -Ln \"\$lib\" ${pkg_dest}/syslib/ 2>/dev/null || true
+        done < /tmp/r-syslibs.txt
+        echo \"Carried \$(ls -1 ${pkg_dest}/syslib | wc -l) shared libraries into ${pkg_dest}/syslib\"
+        rm -f /tmp/r-syslibs.txt
+
+        cat > ${pkg_dest}/pkg-info.json << 'EOF'
+{
+    \"language\": \"r\",
+    \"version\": \"${R_VERSION}\",
+    \"build_platform\": \"docker-debian\",
+    \"aliases\": [\"rscript\", \"rstats\"]
+}
+EOF
+
+        cat > ${pkg_dest}/run << 'EOF'
+#!/bin/bash
+SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
+\"\${SCRIPT_DIR}/bin/Rscript\" \"\$@\"
+EOF
+        chmod +x ${pkg_dest}/run
+
+        {
+            echo 'PATH=${pkg_dest}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.'
+            echo 'R_HOME=${pkg_dest}/lib/R'
+            echo 'LD_LIBRARY_PATH=${pkg_dest}/lib/R/lib:${pkg_dest}/syslib'
+            echo 'R_LIBS_SITE=${pkg_dest}/lib/R/site-library'
+        } > ${pkg_dest}/.env
+
+        echo \$(date +%s)000 > ${pkg_dest}/.package-installed
+    "
+
+    echo "R ${R_VERSION} registered"
+}
+
 main() {
     echo "=============================================="
     echo "  Code Interpreter API - Package Builder"
@@ -541,6 +703,8 @@ main() {
             tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
             libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
             libfreetype6-dev \
+            gfortran libblas-dev liblapack-dev libicu-dev libpcre2-dev \
+            liblzma-dev libjpeg-dev libtiff-dev cmake libuv1-dev \
         && rm -rf /var/lib/apt/lists/*
     "
 
@@ -551,6 +715,7 @@ main() {
     install_bun
     install_bun_packages
     install_bash
+    install_r
 
     echo "Setting permissions..."
     chmod -R a+rX "$PACKAGES_DIR" 2>/dev/null || true

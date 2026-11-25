@@ -68,10 +68,32 @@ RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
     && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
     && git submodule update --init --recursive
 
-RUN make -j$(nproc)
+COPY docker/nsjail-anonymous-control.patch /tmp/nsjail-anonymous-control.patch
+# Upstream hardening, carried over verbatim from docker/Dockerfile.worker-sandbox.
+# The patch replaces NsJail's parent/child control socketpair with anonymous
+# pipes and makes runChild() refuse the descriptor-passing modes outright
+# (seccomp_unotify, user-mode networking). NL3_EXISTS=no drops the libnl
+# transport: network-isolated jobs never need it, and removing it keeps sendmsg
+# out of the supervisor and fails closed for interface/traffic-rule
+# configuration. The NsJail commit pinned above is the same one upstream pins,
+# so the patch applies cleanly.
+RUN git apply /tmp/nsjail-anonymous-control.patch && make -j$(nproc) NL3_EXISTS=no
 
+# api/src/entrypoint.sh — the start target for every sandbox stage below — runs
+# the NsJail smoke test through sandbox-supervisor-policy and then execs the API
+# through it as well, and exports SANDBOX_PIPE_ADDON pointing at
+# anonymous-pipes.node. The bundle resolves tool-call-pipe-bridge at run time.
+# All three arrived upstream after this file was forked at v1.6.7; without them
+# the sandbox dies at startup with "FATAL: NsJail smoke test failed".
 COPY api/src/spec-guard.c /tmp/spec-guard.c
-RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
+COPY api/src/tool-call-pipe-bridge.c /tmp/tool-call-pipe-bridge.c
+COPY api/src/anonymous-pipes.c /tmp/anonymous-pipes.c
+COPY api/src/supervisor-policy.c /tmp/supervisor-policy.c
+COPY --from=node:22.23.4-slim /usr/local/include/node /usr/local/include/node
+RUN gcc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/local/include/node -o /usr/local/lib/anonymous-pipes.node /tmp/anonymous-pipes.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/sandbox-supervisor-policy /tmp/supervisor-policy.c \
+    && gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/tool-call-pipe-bridge /tmp/tool-call-pipe-bridge.c \
+    && gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
     && chmod 0111 /usr/local/bin/spec-guard
 
 # ============================================================================
@@ -101,11 +123,18 @@ RUN bun install --frozen-lockfile
 COPY api/src ./src
 COPY shared /shared
 COPY api/tsconfig.json ./
-# Build sandbox API for Bun and tool-call socket proxy for Node (CJS).
-# The proxy must run under Node, not Bun: Bun's node:http compat layer never
-# fires 'connection' events which silently disables DoS protections.
-RUN bun build ./src/index.ts --minify --outdir .build --target bun --external '@opentelemetry/*' && \
-    bun build ./src/tool-call-socket-proxy.ts --target=node --format=cjs --outfile=.build/tool-call-socket-proxy.cjs
+# Build sandbox API for Bun, plus the tool-call broker for Node (CJS). The
+# broker must run under Node, not Bun: Bun's node:http compat layer never fires
+# 'connection' events, which silently disables the broker's DoS protections.
+#
+# Delegate to api/package.json's "build" script rather than inlining the
+# commands. This file is a fork of api/Dockerfile, and the inlined form pinned
+# the v1.6.7 entry point name: upstream renamed
+# src/tool-call-socket-proxy.ts to src/tool-call-pipe-broker.ts, and the merge
+# to v1.11.0 broke the build with "ModuleNotFound". Upstream runs
+# `bun run build` here for the same reason, so the command now has one
+# definition that moves with the code.
+RUN bun run build
 
 # ============================================================================
 # Stage 4: Build sandbox rootfs (full OS layer for the microVM guest)
@@ -148,6 +177,14 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+# The runtime half of the v1.11.0 pipe/supervisor work compiled in
+# nsjail-builder. api/src/entrypoint.sh execs the API through
+# sandbox-supervisor-policy and defaults SANDBOX_PIPE_ADDON to this path, so
+# all three have to be present or the sandbox refuses to start.
+COPY --from=nsjail-builder /usr/local/bin/tool-call-pipe-bridge /usr/local/bin/tool-call-pipe-bridge
+COPY --from=nsjail-builder /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/sandbox-supervisor-policy
+COPY --from=nsjail-builder /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 RUN chmod +x /usr/sbin/nsjail
 
 WORKDIR /sandbox_api
@@ -293,6 +330,14 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 # NsJail binary and spec-guard from builder
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+# The runtime half of the v1.11.0 pipe/supervisor work compiled in
+# nsjail-builder. api/src/entrypoint.sh execs the API through
+# sandbox-supervisor-policy and defaults SANDBOX_PIPE_ADDON to this path, so
+# all three have to be present or the sandbox refuses to start.
+COPY --from=nsjail-builder /usr/local/bin/tool-call-pipe-bridge /usr/local/bin/tool-call-pipe-bridge
+COPY --from=nsjail-builder /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/sandbox-supervisor-policy
+COPY --from=nsjail-builder /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
 
 # Node binary for tool-call-socket-proxy.cjs (must run under Node, not Bun)
@@ -400,6 +445,14 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+# The runtime half of the v1.11.0 pipe/supervisor work compiled in
+# nsjail-builder. api/src/entrypoint.sh execs the API through
+# sandbox-supervisor-policy and defaults SANDBOX_PIPE_ADDON to this path, so
+# all three have to be present or the sandbox refuses to start.
+COPY --from=nsjail-builder /usr/local/bin/tool-call-pipe-bridge /usr/local/bin/tool-call-pipe-bridge
+COPY --from=nsjail-builder /usr/local/bin/sandbox-supervisor-policy /usr/local/bin/sandbox-supervisor-policy
+COPY --from=nsjail-builder /usr/local/lib/anonymous-pipes.node /usr/local/lib/anonymous-pipes.node
+ENV SANDBOX_PIPE_ADDON=/usr/local/lib/anonymous-pipes.node
 RUN chmod +x /usr/sbin/nsjail /usr/local/bin/spec-guard
 
 # tool-call-socket-proxy.cjs must run under Node, not Bun: Bun's node:http
@@ -413,6 +466,17 @@ RUN libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
 
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk || true
 
+# Point /usr/bin/which straight at the binary instead of through
+# update-alternatives. See api/Dockerfile for the full rationale; in short,
+# Debian ships /usr/bin/which -> /etc/alternatives/which ->
+# /usr/bin/which.debianutils, and the jail mounts /usr but not
+# /etc/alternatives, so inside the sandbox that chain dangles. R needs it:
+# base::Sys.which() has "/usr/bin/which" compiled in at configure time, utils'
+# .onLoad calls it, and a broken link takes utils down, then stats with it.
+RUN [ -x /usr/bin/which.debianutils ] \
+    && ln -sf /usr/bin/which.debianutils /usr/bin/which \
+    && [ "$(readlink /usr/bin/which)" = /usr/bin/which.debianutils ]
+
 # --- Sandbox API ---
 WORKDIR /sandbox_api
 COPY api/package.json ./
@@ -425,8 +489,29 @@ RUN chmod +x ./entrypoint.sh
 # --- Runtime packages, baked in ---
 # The build toolchain is installed, used, and purged in one layer so the
 # compilers never ship inside an image that runs untrusted code.
+#
+# "core" builds only the first tier of r-packages.txt, for shorter local
+# iteration. Image builds for a deployed environment keep the default.
+ARG R_PACKAGE_SET=full
+ENV R_PACKAGE_SET=${R_PACKAGE_SET}
 COPY docker/package-init.sh /package-init.sh
+# package-init.sh resolves "${SCRIPT_DIR}/python-runtime/install.py", so this
+# tree has to sit beside the script. Upstream added docker/python-runtime after
+# this file was forked at v1.6.7, and without it the Python step dies with
+# "can't open file '//python-runtime/install.py'" and exits 2.
+COPY docker/python-runtime /python-runtime
 COPY javascript-packages.txt /javascript-packages.txt
+COPY r-packages.txt /r-packages.txt
+# The last two install lines are R's toolchain: CRAN ships no arm64 Linux
+# binaries, so every R package in r-packages.txt is compiled here from source.
+# cmake is for nloptr, which builds a bundled NLopt (and which lme4 and car
+# need); libuv1-dev is for fs, which stopped bundling libuv (and which sass,
+# bslib, htmlwidgets and plotly need).
+#
+# Purging these afterwards is safe for R specifically because package-init.sh's
+# "Register R" step runs first and copies every shared object R resolves outside
+# /pkgs into /pkgs/r/<version>/syslib, with LD_LIBRARY_PATH pointing there. That
+# is what lets the compilers and -dev packages leave while R keeps running.
 RUN chmod +x /package-init.sh \
     && mkdir -p /pkgs \
     && apt-get update \
@@ -436,15 +521,22 @@ RUN chmod +x /package-init.sh \
          tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
          libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
          libfreetype6-dev \
-    && JS_PACKAGE_MANIFEST=/javascript-packages.txt /package-init.sh \
+         gfortran libblas-dev liblapack-dev libicu-dev libpcre2-dev \
+         liblzma-dev libjpeg-dev libtiff-dev cmake libuv1-dev \
+    && JS_PACKAGE_MANIFEST=/javascript-packages.txt \
+       R_PACKAGE_MANIFEST=/r-packages.txt /package-init.sh \
     && test -s /pkgs/.initialized \
+    && ls /pkgs/r/*/.package-installed >/dev/null \
     && apt-get purge -y --auto-remove \
          build-essential libssl-dev libffi-dev libsqlite3-dev \
          zlib1g-dev libbz2-dev libreadline-dev libncurses-dev \
          tk-dev libcurl4-openssl-dev libfontconfig1-dev \
          libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
          libfreetype6-dev \
-    && rm -rf /var/lib/apt/lists/* /package-init.sh /javascript-packages.txt
+         gfortran libblas-dev liblapack-dev libicu-dev libpcre2-dev \
+         liblzma-dev libjpeg-dev libtiff-dev cmake libuv1-dev \
+    && rm -rf /var/lib/apt/lists/* /package-init.sh /javascript-packages.txt \
+         /r-packages.txt /python-runtime
 
 RUN mkdir -p /tmp/sandbox
 

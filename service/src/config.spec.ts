@@ -107,8 +107,27 @@ describe('R language configuration', () => {
     // .onLoad fails, stats follows, and every R job dies with the unhelpful
     // "Function not implemented".
     const root = path.resolve(__dirname, '../..');
-    const dockerfile = readFileSync(path.join(root, 'api/Dockerfile'), 'utf8');
-    expect(dockerfile).toContain('ln -sf /usr/bin/which.debianutils /usr/bin/which');
+    for (const file of ['api/Dockerfile', 'docker/Dockerfile.bu-sandbox']) {
+      expect(readFileSync(path.join(root, file), 'utf8'))
+        .toContain('ln -sf /usr/bin/which.debianutils /usr/bin/which');
+    }
+  });
+
+  it('bakes R into the BU sandbox image, not only the upstream one', () => {
+    // docker/Dockerfile.bu-sandbox is a fork of api/Dockerfile and is what
+    // actually builds the deployed `sandbox` and `sandbox-microvm` images;
+    // api/Dockerfile builds neither. Patching only the upstream file leaves
+    // every other R assertion here green while the shipped image has no R at
+    // all, so assert the fork carries the manifest and the R toolchain too.
+    const root = path.resolve(__dirname, '../..');
+    const fork = readFileSync(path.join(root, 'docker/Dockerfile.bu-sandbox'), 'utf8');
+    expect(fork).toContain('COPY r-packages.txt /r-packages.txt');
+    expect(fork).toContain('R_PACKAGE_MANIFEST=/r-packages.txt');
+    // Compiling the manifest from source needs these; without them
+    // install.packages() fails and package-init.sh exits non-zero.
+    for (const pkg of ['gfortran', 'libblas-dev', 'liblapack-dev', 'cmake', 'libuv1-dev']) {
+      expect(fork).toContain(pkg);
+    }
   });
 
   it('keeps the R package manifest readable by package-init.sh', () => {
