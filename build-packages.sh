@@ -662,7 +662,10 @@ EOF
         cat > ${pkg_dest}/run << 'EOF'
 #!/bin/bash
 SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
-\"\${SCRIPT_DIR}/bin/Rscript\" \"\$@\"
+export R_HOME=\"\${SCRIPT_DIR}/lib/R\"
+export R_LIBS_SITE=\"\${SCRIPT_DIR}/lib/R/site-library\"
+export LD_LIBRARY_PATH=\"\${SCRIPT_DIR}/lib/R/lib:\${SCRIPT_DIR}/syslib\${LD_LIBRARY_PATH:+:}\${LD_LIBRARY_PATH}\"
+exec \"\${SCRIPT_DIR}/bin/Rscript\" \"\$@\"
 EOF
         chmod +x ${pkg_dest}/run
 

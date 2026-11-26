@@ -668,6 +668,9 @@ if [ -n "$R_ARCH" ]; then
             cat > "$rscript" << RSCRIPT
 #!/bin/bash
 R_BIN="${R_DEST}/bin/R"
+# Same reasoning as the run launcher: package build scripts call this directly
+# through R_HOME, where no .env has been applied.
+export LD_LIBRARY_PATH="${R_DEST}/lib/R/lib:${R_DEST}/syslib\${LD_LIBRARY_PATH:+:}\${LD_LIBRARY_PATH}"
 if [ "\$#" -eq 0 ] || [ "\${1#-}" != "\$1" ]; then
     # No file argument, or a flag such as -e: hand through unchanged.
     exec "\$R_BIN" --no-echo --no-restore "\$@"
@@ -800,10 +803,23 @@ if [ -n "$R_ARCH" ] && [ "$INSTALL_FAILED" != true ]; then
 }
 EOF
 
+    # The launcher sets R_HOME and LD_LIBRARY_PATH itself rather than trusting
+    # the caller to have applied .env. R is the only runtime here that cannot
+    # even start without LD_LIBRARY_PATH: the build purges the toolchain, so
+    # libblas, liblapack and libgfortran exist ONLY in syslib, and exec/R dies
+    # with "libblas.so.3: cannot open shared object file" before any R code
+    # runs. Every other runtime needs no more than PATH, which the shell
+    # resolves anyway, so for them a dropped .env degrades quietly; for R it is
+    # fatal and the message names neither R nor the missing environment.
+    # R's own lib/R/etc/ldpaths appends whatever it inherits, so exporting here
+    # composes with it instead of fighting it. .env is kept as well.
     cat > "$R_DEST/run" << 'EOF'
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/bin/Rscript" "$@"
+export R_HOME="${SCRIPT_DIR}/lib/R"
+export R_LIBS_SITE="${SCRIPT_DIR}/lib/R/site-library"
+export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib/R/lib:${SCRIPT_DIR}/syslib${LD_LIBRARY_PATH:+:}${LD_LIBRARY_PATH}"
+exec "${SCRIPT_DIR}/bin/Rscript" "$@"
 EOF
     chmod +x "$R_DEST/run"
 
